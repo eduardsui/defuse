@@ -366,7 +366,10 @@ HRESULT GetPlaceholderInfoCallback_C(const PRJ_CALLBACK_DATA* CallbackData) {
             if (S_ISDIR(st_buf.st_mode))
                 info.FileBasicInfo.IsDirectory = TRUE;
 
-            PrjWritePlaceholderInfo(f->instanceHandle, CallbackData->FilePathName, &info, sizeof(info));
+            HRESULT hr = PrjWritePlaceholderInfo(f->instanceHandle, CallbackData->FilePathName, &info, sizeof(info));
+            if (FAILED(hr)) {
+                fprintf(stderr, "FAIL!\n");
+            }
         }
 
         if (res < 0)
@@ -460,12 +463,9 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
         offset += written;
     }
     fclose(local_file);
-    unlink(full_path);
-    PrjDeleteFile(f->instanceHandle, DestinationFileName, 0, NULL);
 
-    // PRJ_PLACEHOLDER_INFO info;
-    // memset(&info, 0, sizeof(PRJ_PLACEHOLDER_INFO));
-    // PrjUpdateFileIfNeeded(f->instanceHandle, DestinationFileName, &info, sizeof(info), 0, NULL);
+    PRJ_UPDATE_FAILURE_CAUSES err_cause = PRJ_UPDATE_FAILURE_CAUSE_NONE;
+    PrjDeleteFile(f->instanceHandle, DestinationFileName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY, &err_cause);
 
     return err;
 }
@@ -520,10 +520,9 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA* CallbackData, BOOLEAN Is
                         err = EACCES;
 
                 }
-                if (f->op.release) {
-                    finfo = guid_file_info(f, &CallbackData->DataStreamId);
+                if (f->op.release)
                     ret = f->op.release(path, finfo);
-                }
+
                 if ((!ret) && (err))
                     ret = err;
                 guid_close(f, &CallbackData->DataStreamId);
