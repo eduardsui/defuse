@@ -1,6 +1,3 @@
-#ifndef __gyrofs_h
-#define __gyrofs_h
-
 #include "gyro_fuse.h"
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -95,7 +92,7 @@ static void* guid_data(struct fuse* f, const GUID * EnumerationId) {
     uint64_t hash = guid64(EnumerationId);
 
     void* data = NULL;
-    khint_t k = (struct fuse_file_info*)kh_get(guid, f->guids, hash);
+    khint_t k = kh_get(guid, f->guids, hash);
     if ((k != kh_end(f->guids)) && (kh_exist(f->guids, k)))
         data = kh_val(f->guids, k);
 
@@ -121,7 +118,7 @@ static void *guid_remove_key(struct fuse* f, const GUID* EnumerationId) {
 
     uint64_t hash = guid64(EnumerationId);
     void* data = NULL;
-    khint_t k = (struct fuse_file_info*)kh_get(guid, f->guids, hash);
+    khint_t k = kh_get(guid, f->guids, hash);
     if ((k != kh_end(f->guids)) && (kh_exist(f->guids, k))) {
         data = kh_val(f->guids, k);
         kh_del(guid, f->guids, k);
@@ -129,11 +126,11 @@ static void *guid_remove_key(struct fuse* f, const GUID* EnumerationId) {
     return data;
 }
 
-static struct fuse_file_info* guid_file_info(struct fuse* f, const GUID* EnumerationId) {
+static struct fuse_file_info *guid_file_info(struct fuse* f, const GUID* EnumerationId) {
     if (!EnumerationId)
         return NULL;
 
-    struct fuse_file_info* finfo = guid_data(f, EnumerationId);
+    struct fuse_file_info *finfo = (struct fuse_file_info *)guid_data(f, EnumerationId);
     if (!finfo) {
         finfo = (struct fuse_file_info*)malloc(sizeof(struct fuse_file_info));
         if (!finfo)
@@ -148,7 +145,7 @@ static void guid_close(struct fuse* f, const GUID* EnumerationId) {
     if (!EnumerationId)
         return;
 
-    struct fuse_file_info* finfo = guid_remove_key(f, EnumerationId);
+    struct fuse_file_info *finfo = (struct fuse_file_info *)guid_remove_key(f, EnumerationId);
     if (finfo)
         free(finfo);
 }
@@ -157,7 +154,7 @@ static char* toUTF8(const wchar_t* src) {
     if (!src)
         return NULL;
 
-    size_t len = wcslen(src);
+    int len = (int)wcslen(src);
     int utf8_len = WideCharToMultiByte(CP_UTF8, 0, src, len, 0, 0, NULL, NULL);
     char *buf = (char *)malloc((utf8_len + 1) * sizeof(char));
     if (buf) {
@@ -174,7 +171,7 @@ static char* toUTF8_path(const wchar_t* src) {
     int add_path = 0;
     if (src[0] != '/')
         add_path = 1;
-    size_t len = wcslen(src);
+    int len = (int)wcslen(src);
     int utf8_len = WideCharToMultiByte(CP_UTF8, 0, src, len, 0, 0, NULL, NULL);
     char* buf = (char*)malloc((utf8_len + add_path  + 1) * sizeof(char));
     if (buf) {
@@ -190,7 +187,7 @@ static wchar_t* fromUTF8(const char* src) {
     if (!src)
         return NULL;
 
-    size_t len = strlen(src);
+    int len = (int)strlen(src);
     int length = MultiByteToWideChar(CP_UTF8, 0, src, len, 0, 0);
     wchar_t* buf = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
     if (buf) {
@@ -225,7 +222,7 @@ HRESULT EndDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
     if (!f)
         return S_FALSE;
 
-    struct fuse_file_info* finfo = guid_remove_key(f, EnumerationId);
+    struct fuse_file_info *finfo = (struct fuse_file_info *)guid_remove_key(f, EnumerationId);
     if (f->op.releasedir) {
         char *dir_name = toUTF8(CallbackData->FilePathName);
         f->op.releasedir(((dir_name) && (dir_name[0])) ? dir_name : "/", finfo);
@@ -241,11 +238,14 @@ HRESULT EndDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
 static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, off_t off, enum fuse_fill_dir_flags flags) {
     struct fuse* f = (struct fuse*)((void**)buf)[0];
     PRJ_DIR_ENTRY_BUFFER_HANDLE DirEntryBufferHandle = (PRJ_DIR_ENTRY_BUFFER_HANDLE)((void**)buf)[1];
-    PCWSTR SearchExpression = (struct fuse*)((void**)buf)[2];
+    PCWSTR SearchExpression = (PCWSTR)((void**)buf)[2];
     struct fuse_file_info* finfo = (struct fuse_file_info*)((void**)buf)[3];
     PRJ_FILE_BASIC_INFO info;
     struct stat stbuf2;
     char *path = (char *)((void**)buf)[4];
+
+    if ((!finfo) || (!f) || (!DirEntryBufferHandle))
+        return -EIO;
 
     if (off < finfo->offset)
         return 0;
@@ -259,8 +259,8 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
 
     if ((!stbuf) && (f->op.getattr) && (name) && (path) && (path[0])) {
         memset(&stbuf2, 0, sizeof(stbuf2));
-        int len_name = strlen(name);
-        int len_path = strlen(path);
+        int len_name = (int)strlen(name);
+        int len_path = (int)strlen(path);
         char *full_path = (char* )malloc(len_path + len_name + 2);
         if (full_path) {
             memcpy(full_path, path, len_path);
@@ -321,10 +321,10 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
 
         void* data[5];
         data[0] = (void*)f;
-        data[1] = DirEntryBufferHandle;
-        data[2] = SearchExpression;
+        data[1] = (void *)DirEntryBufferHandle;
+        data[2] = (void*)SearchExpression;
         data[3] = (void*)finfo;
-        data[4] = ((dir_name) && (dir_name[0])) ? dir_name : "/";
+        data[4] = (void*)(((dir_name) && (dir_name[0])) ? dir_name : "/");
 
         res = f->op.readdir((char *)data[4], data, fuse_fill_dir, finfo->offset, finfo, 0);
         free(dir_name);
@@ -397,7 +397,7 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
     if ((!err) && (f->op.read)) {
         char* buffer = (char* )PrjAllocateAlignedBuffer(f->instanceHandle, Length);
         if (buffer) {
-            err = f->op.read(path, buffer, Length, ByteOffset, &fi);
+            err = f->op.read(path, buffer, Length, (off_t)ByteOffset, &fi);
             if (err > 0)
                 PrjWriteFileData(f->instanceHandle, &CallbackData->DataStreamId, buffer, ByteOffset, err);
 
@@ -441,7 +441,7 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
     int bytes_read = 0;
     off_t offset = 0;
     while (!feof(local_file)) {
-        int bytes = fread(buffer, 1, sizeof(buffer), local_file);
+        size_t bytes = fread(buffer, 1, sizeof(buffer), local_file);
         if (bytes <= 0) {
             if (bytes < 0)
                 err = -EIO;
@@ -487,7 +487,7 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA* CallbackData, BOOLEAN Is
                 if (f->op.open) {
                     finfo = guid_file_info(f, &CallbackData->DataStreamId);
                     path = toUTF8_path(CallbackData->FilePathName);
-                    ret = f->op.open(path, 0755, finfo);
+                    ret = f->op.open(path, finfo);
                 }
             }
             break;
@@ -674,5 +674,3 @@ void fuse_destroy(struct fuse* f) {
         free(f);
     }
 }
-
-#endif // __gyro_h
