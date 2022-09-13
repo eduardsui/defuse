@@ -313,7 +313,6 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
     if (f->op.readdir) {
         struct fuse_file_info* finfo = guid_file_info(f, EnumerationId);
 
-        fprintf(stderr, "DIR!\n");
         // important to avoid unnecessary calls to readdir function
         if ((finfo->offset) && (!finfo->failed_buffer))
             return S_OK;
