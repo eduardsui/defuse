@@ -22,6 +22,11 @@ struct fuse_chan {
     struct fuse *fs;
 };
 
+struct dirinfo_data {
+    wchar_t *name;
+    PRJ_FILE_BASIC_INFO info;
+};
+
 struct fuse {
     PRJ_STARTVIRTUALIZING_OPTIONS options;
     PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT instanceHandle;
@@ -36,6 +41,8 @@ struct fuse {
 
     khash_t(guid)* guids;
 };
+
+#define LARGE_TIME(src) ((unsigned __int64)src)*10000000 + 116444736000000000LL;
 
 static uint64_t guid64(const GUID *guid) {
     char key[sizeof(GUID)];
@@ -153,8 +160,18 @@ static void guid_close(struct fuse* f, const GUID* EnumerationId) {
         return;
 
     struct fuse_file_info *finfo = (struct fuse_file_info *)guid_remove_key(f, EnumerationId);
-    if (finfo)
+    if (finfo) {
+        struct dirinfo_data *dir_list_data = (struct dirinfo_data *)finfo->data;
+        if (dir_list_data) {
+            int i;
+            for (i = 0; i < finfo->data_len; i ++) {
+                wchar_t *dir = dir_list_data[i].name;
+                free(dir);
+            }
+            free(finfo->data);
+        }
         free(finfo);
+    }
 }
 
 static char* toUTF8(const wchar_t* src) {
@@ -261,7 +278,6 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
         finfo->session_offset ++;
         return 0;
     }
-
     memset(&info, 0, sizeof(PRJ_FILE_BASIC_INFO));
 
     if ((!stbuf) && (f->op.getattr) && (name) && (path) && (path[0])) {
@@ -287,10 +303,10 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     if (stbuf) {
         if (S_ISDIR(stbuf->st_mode))
             info.IsDirectory = TRUE;
-        info.CreationTime.QuadPart = stbuf->st_ctime;
-        info.ChangeTime.QuadPart = stbuf->st_mtime;
-        info.LastAccessTime.QuadPart = stbuf->st_atime;
-        info.LastWriteTime.QuadPart = stbuf->st_mtime;
+        info.CreationTime.QuadPart = LARGE_TIME(stbuf->st_ctime);
+        info.ChangeTime.QuadPart = LARGE_TIME(stbuf->st_mtime);
+        info.LastAccessTime.QuadPart = LARGE_TIME(stbuf->st_atime);
+        info.LastWriteTime.QuadPart = LARGE_TIME(stbuf->st_mtime);
         info.FileSize = stbuf->st_size;
     }
 
@@ -298,17 +314,37 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
 
     HRESULT err = 0;
     if (PrjFileNameMatch(dir, SearchExpression)) {
-        err = PrjFillDirEntryBuffer(dir, &info, DirEntryBufferHandle);
+        HRESULT err = PrjFillDirEntryBuffer(dir, &info, DirEntryBufferHandle);
         if (FAILED(err)) {
+            if (err == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+                struct dirinfo_data *dir_list_data = (struct dirinfo_data *)finfo->data;
+                if ((!dir_list_data) && (finfo->data_len >= finfo->data_allocated)) {
+                    dir_list_data = (struct dirinfo_data *)realloc(dir_list_data, sizeof(struct dirinfo_data) * (finfo->data_allocated + 0x100));
+                    if (!dir_list_data) {
+                        free(dir);
+                        return -ENOMEM;
+                    }
+                    finfo->data_allocated += 0x100;
+                    finfo->data = (void *)dir_list_data;
+                }
+
+                dir_list_data[finfo->data_len].info = info;
+                dir_list_data[finfo->data_len].name = dir;
+                finfo->data_len ++;
+                // prevent free
+                dir = NULL;
+                err = S_OK;
+            }
             finfo->failed_buffer = 1;
         } else {
             finfo->session_offset ++;
         }
     }
 
-    free(dir);
+    if (dir)
+        free(dir);
 
-    return (int)err;
+    return err;
 }
 
 HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* EnumerationId, PCWSTR SearchExpression, PRJ_DIR_ENTRY_BUFFER_HANDLE DirEntryBufferHandle) {
@@ -320,8 +356,29 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
     if (f->op.readdir) {
         struct fuse_file_info* finfo = guid_file_info(f, EnumerationId);
 
+        struct dirinfo_data *dir_list_data = (struct dirinfo_data *)finfo->data;
+        if ((finfo->data_len) && (dir_list_data)) {
+            int i;
+            for (i = 0; i < finfo->data_len; i ++) {
+                wchar_t *dir = dir_list_data[i].name;
+                HRESULT hr = PrjFillDirEntryBuffer(dir, &dir_list_data[i].info, DirEntryBufferHandle);
+                if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER))
+                    break;
+
+                free(dir);
+            }
+            if (i) {
+                int j;
+                for (j = 0; j < finfo->data_len - i; j ++)
+                    dir_list_data[j] = dir_list_data[j + i];
+
+                finfo->data_len -= i;
+            }
+            return S_OK;
+        }
+
         // important to avoid unnecessary calls to readdir function
-        if ((finfo->offset) && (!finfo->failed_buffer))
+        if (finfo->offset)
             return S_OK;
 
         char *dir_name = toUTF8(CallbackData->FilePathName);
@@ -362,19 +419,16 @@ HRESULT GetPlaceholderInfoCallback_C(const PRJ_CALLBACK_DATA* CallbackData) {
             PRJ_PLACEHOLDER_INFO info;
             memset(&info, 0, sizeof(PRJ_PLACEHOLDER_INFO));
 
-            info.FileBasicInfo.ChangeTime.QuadPart = st_buf.st_mtime;
-            info.FileBasicInfo.CreationTime.QuadPart = st_buf.st_ctime;
-            info.FileBasicInfo.LastAccessTime.QuadPart = st_buf.st_atime;
-            info.FileBasicInfo.LastWriteTime.QuadPart = st_buf.st_mtime;
+            info.FileBasicInfo.ChangeTime.QuadPart = LARGE_TIME(st_buf.st_mtime);
+            info.FileBasicInfo.CreationTime.QuadPart = LARGE_TIME(st_buf.st_ctime);
+            info.FileBasicInfo.LastAccessTime.QuadPart = LARGE_TIME(st_buf.st_atime);
+            info.FileBasicInfo.LastWriteTime.QuadPart = LARGE_TIME(st_buf.st_mtime);
             info.FileBasicInfo.FileSize = st_buf.st_size;
 
             if (S_ISDIR(st_buf.st_mode))
                 info.FileBasicInfo.IsDirectory = TRUE;
 
-            HRESULT hr = PrjWritePlaceholderInfo(f->instanceHandle, CallbackData->FilePathName, &info, sizeof(info));
-            if (FAILED(hr)) {
-                fprintf(stderr, "FAIL!\n");
-            }
+            PrjWritePlaceholderInfo(f->instanceHandle, CallbackData->FilePathName, &info, sizeof(info));
         }
 
         if (res < 0)
