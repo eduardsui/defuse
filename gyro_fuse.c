@@ -38,7 +38,7 @@ struct fuse {
     void *user_data;
     char *path_utf8;
     char running;
-
+    
     khash_t(guid)* guids;
 };
 
@@ -308,6 +308,11 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
         info.LastAccessTime.QuadPart = LARGE_TIME(stbuf->st_atime);
         info.LastWriteTime.QuadPart = LARGE_TIME(stbuf->st_mtime);
         info.FileSize = stbuf->st_size;
+
+        if ((name) && (name[0] == '.'))
+            info.FileAttributes = FILE_ATTRIBUTE_HIDDEN;
+        else
+            info.FileAttributes = FILE_ATTRIBUTE_NORMAL;
     }
 
     wchar_t* dir = fromUTF8(name);
@@ -374,6 +379,7 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
 
                 finfo->data_len -= i;
             }
+
             return S_OK;
         }
 
@@ -428,6 +434,8 @@ HRESULT GetPlaceholderInfoCallback_C(const PRJ_CALLBACK_DATA* CallbackData) {
             if (S_ISDIR(st_buf.st_mode))
                 info.FileBasicInfo.IsDirectory = TRUE;
 
+            info.FileBasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+
             PrjWritePlaceholderInfo(f->instanceHandle, CallbackData->FilePathName, &info, sizeof(info));
         }
 
@@ -447,16 +455,24 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
     struct stat st_buf;
     memset(&st_buf, 0, sizeof(st_buf));
 
-    char* path = toUTF8_path(CallbackData->FilePathName);
+    char *path = toUTF8_path(CallbackData->FilePathName);
 
     int err = 0;
 
     if ((!err) && (f->op.read)) {
-        char* buffer = (char* )PrjAllocateAlignedBuffer(f->instanceHandle, Length);
+        char *buffer = (char *)PrjAllocateAlignedBuffer(f->instanceHandle, Length);
         if (buffer) {
-            err = f->op.read(path, buffer, Length, (off_t)ByteOffset, guid_file_info(f, &CallbackData->DataStreamId));
-            if (err > 0)
-                PrjWriteFileData(f->instanceHandle, &CallbackData->DataStreamId, buffer, ByteOffset, err);
+            struct fuse_file_info *finfo = guid_file_info(f, &CallbackData->FileId);
+            off_t buffer_offset = 0;
+            do {
+                err = f->op.read(path, buffer + buffer_offset, Length - buffer_offset, (off_t)ByteOffset + buffer_offset, finfo);
+                if (err > 0)
+                    buffer_offset += err;
+                if (buffer_offset >= Length)
+                    break;
+            } while (err > 0);
+
+            PrjWriteFileData(f->instanceHandle, &CallbackData->DataStreamId, buffer, ByteOffset, buffer_offset);
 
             PrjFreeAlignedBuffer(buffer);
             if (err > 0)
@@ -503,7 +519,6 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
                 err = -EIO;
             break;
         }
-
         off_t written = 0;
         do {
             err = f->op.write(path, buffer + written, bytes - written, offset + written, finfo);
@@ -519,29 +534,27 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
         offset += written;
     }
     fclose(local_file);
-
-    PRJ_UPDATE_FAILURE_CAUSES err_cause = PRJ_UPDATE_FAILURE_CAUSE_NONE;
-    PrjDeleteFile(f->instanceHandle, DestinationFileName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY, &err_cause);
-
     return err;
 }
 
-HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA* CallbackData, BOOLEAN IsDirectory, PRJ_NOTIFICATION NotificationType, PCWSTR DestinationFileName, PRJ_NOTIFICATION_PARAMETERS* NotificationParameters) {
+HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN IsDirectory, PRJ_NOTIFICATION NotificationType, PCWSTR DestinationFileName, PRJ_NOTIFICATION_PARAMETERS *NotificationParameters) {
     struct fuse* f = (struct fuse*)CallbackData->InstanceContext;
     if (!f)
         return S_FALSE;
+
 
     int ret = EACCES;
     struct fuse_file_info *finfo;
     char* path = NULL;
     int err = 0;
 
+    PRJ_UPDATE_FAILURE_CAUSES err_cause = PRJ_UPDATE_FAILURE_CAUSE_NONE;
     switch (NotificationType) {
         case PRJ_NOTIFICATION_FILE_OPENED:
             ret = 0;
             if (!IsDirectory) {
                 if (f->op.open) {
-                    finfo = guid_file_info(f, &CallbackData->DataStreamId);
+                    finfo = guid_file_info(f, &CallbackData->FileId);
                     path = toUTF8_path(CallbackData->FilePathName);
                     ret = f->op.open(path, finfo);
                 }
@@ -555,25 +568,30 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA* CallbackData, BOOLEAN Is
                 }
             } else {
                 if (f->op.create) {
-                    finfo = guid_file_info(f, &CallbackData->DataStreamId);
+                    finfo = guid_file_info(f, &CallbackData->FileId);
                     path = toUTF8_path(CallbackData->FilePathName);
                     ret = f->op.create(path, 0755, finfo);
                 }
             }
             break;
         case PRJ_NOTIFICATION_FILE_OVERWRITTEN:
+            PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
+            ret = 0;
             break;
         case PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION:
         case PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED:            
         case PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED:
             if (!IsDirectory) {
                 path = toUTF8_path(CallbackData->FilePathName);
-                finfo = guid_file_info(f, &CallbackData->DataStreamId);
+                finfo = guid_file_info(f, &CallbackData->FileId);
                 if ((NotificationType == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED) || (finfo->needs_sync)) {
-                    if (f->op.write)
-                        err = fuse_sync_full_sync(f, path, CallbackData->FilePathName, finfo);
-                    else
-                        err = EACCES;
+                    PRJ_FILE_STATE fileState;
+                    if ((!FAILED(PrjGetOnDiskFileState(CallbackData->FilePathName, &fileState))) && (fileState & PRJ_FILE_STATE_HYDRATED_PLACEHOLDER)) {
+                        if (f->op.write) {
+                            err = fuse_sync_full_sync(f, path, CallbackData->FilePathName, finfo);
+                        } else
+                            err = EACCES;
+                    }
 
                 }
                 if (f->op.release)
@@ -581,8 +599,9 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA* CallbackData, BOOLEAN Is
 
                 if ((!ret) && (err))
                     ret = err;
-                guid_close(f, &CallbackData->DataStreamId);
+                guid_close(f, &CallbackData->FileId);
             }
+            PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
             // no break on delete to trigger the delete events
             if (NotificationType != PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED)
                 break;
@@ -610,12 +629,13 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA* CallbackData, BOOLEAN Is
         case PRJ_NOTIFICATION_PRE_SET_HARDLINK:
             break;
         case PRJ_NOTIFICATION_FILE_RENAMED:
+            err = 0;
             break;
         case PRJ_NOTIFICATION_HARDLINK_CREATED:
             break;
         case PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL:
             if (!IsDirectory) {
-                finfo = guid_file_info(f, &CallbackData->DataStreamId);
+                finfo = guid_file_info(f, &CallbackData->FileId);
                 if (finfo)
                     finfo->needs_sync = 1;
                 ret = 0;
@@ -654,6 +674,8 @@ struct fuse* fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operat
     this_ref->notificationMappings[0].NotificationRoot = L"";
     this_ref->notificationMappings[0].NotificationBitMask = PRJ_NOTIFY_FILE_OPENED | PRJ_NOTIFY_NEW_FILE_CREATED | PRJ_NOTIFY_FILE_OVERWRITTEN | PRJ_NOTIFY_PRE_DELETE | PRJ_NOTIFY_PRE_RENAME | PRJ_NOTIFY_PRE_SET_HARDLINK | PRJ_NOTIFY_FILE_RENAMED | PRJ_NOTIFY_HARDLINK_CREATED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED | PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL;
 
+    // this_ref->options.PoolThreadCount = 1;
+    // this_ref->options.ConcurrentThreadCount = 1;
     this_ref->options.NotificationMappings = this_ref->notificationMappings;
     this_ref->options.NotificationMappingsCount = 1;
 
