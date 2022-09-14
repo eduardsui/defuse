@@ -254,7 +254,7 @@ HRESULT EndDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
     }
 
     if (finfo)
-       free(finfo);
+        guid_close(f, EnumerationId);
 
     return S_OK;
 }
@@ -318,6 +318,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     wchar_t* dir = fromUTF8(name);
 
     HRESULT err = 0;
+
     if (PrjFileNameMatch(dir, SearchExpression)) {
         HRESULT err = PrjFillDirEntryBuffer(dir, &info, DirEntryBufferHandle);
         if (FAILED(err)) {
@@ -341,10 +342,9 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
                 err = S_OK;
             }
             finfo->failed_buffer = 1;
-        } else {
-            finfo->session_offset ++;
         }
     }
+    finfo->session_offset ++;
 
     if (dir)
         free(dir);
@@ -369,7 +369,6 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
                 HRESULT hr = PrjFillDirEntryBuffer(dir, &dir_list_data[i].info, DirEntryBufferHandle);
                 if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER))
                     break;
-
                 free(dir);
             }
             if (i) {
@@ -473,7 +472,6 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
             } while (err > 0);
 
             PrjWriteFileData(f->instanceHandle, &CallbackData->DataStreamId, buffer, ByteOffset, buffer_offset);
-
             PrjFreeAlignedBuffer(buffer);
             if (err > 0)
                 err = 0;
@@ -497,7 +495,6 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
     char full_path[4096];
     full_path[0] = 0;
 
-    snprintf(full_path, sizeof(full_path), "%s%s", f->path_utf8, path);
     int err = 0;
 
     FILE* local_file = fopen(full_path, "rb");
@@ -549,6 +546,8 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
     int err = 0;
 
     PRJ_UPDATE_FAILURE_CAUSES err_cause = PRJ_UPDATE_FAILURE_CAUSE_NONE;
+    PRJ_FILE_STATE fileState;
+
     switch (NotificationType) {
         case PRJ_NOTIFICATION_FILE_OPENED:
             ret = 0;
@@ -585,7 +584,6 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                 path = toUTF8_path(CallbackData->FilePathName);
                 finfo = guid_file_info(f, &CallbackData->FileId);
                 if ((NotificationType == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED) || (finfo->needs_sync)) {
-                    PRJ_FILE_STATE fileState;
                     if ((!FAILED(PrjGetOnDiskFileState(CallbackData->FilePathName, &fileState))) && (fileState & PRJ_FILE_STATE_HYDRATED_PLACEHOLDER)) {
                         if (f->op.write) {
                             err = fuse_sync_full_sync(f, path, CallbackData->FilePathName, finfo);
@@ -597,11 +595,15 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                 if (f->op.release)
                     ret = f->op.release(path, finfo);
 
+                if (finfo->needs_sync)
+                    PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
+
                 if ((!ret) && (err))
                     ret = err;
                 guid_close(f, &CallbackData->FileId);
-            }
-            PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
+            } else
+                PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
+
             // no break on delete to trigger the delete events
             if (NotificationType != PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED)
                 break;
@@ -635,7 +637,7 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
             break;
         case PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL:
             if (!IsDirectory) {
-                finfo = guid_file_info(f, &CallbackData->FileId);
+                finfo = guid_data(f, &CallbackData->FileId);
                 if (finfo)
                     finfo->needs_sync = 1;
                 ret = 0;
