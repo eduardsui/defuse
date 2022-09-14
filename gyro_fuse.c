@@ -17,14 +17,21 @@
 
 KHASH_MAP_INIT_INT64(guid, void *)
 
+struct fuse_chan {
+    wchar_t path[MAX_PATH + 1];
+    struct fuse *fs;
+};
+
 struct fuse {
     PRJ_STARTVIRTUALIZING_OPTIONS options;
     PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT instanceHandle;
     PRJ_CALLBACKS callbacks;
     PRJ_NOTIFICATION_MAPPING notificationMappings[1];
     struct fuse_operations op;
-    wchar_t path[MAX_PATH + 1];
-    char* path_utf8;
+    struct fuse_conn_info connection;
+    struct fuse_chan *ch;
+    void *user_data;
+    char *path_utf8;
     char running;
 
     khash_t(guid)* guids;
@@ -235,7 +242,7 @@ HRESULT EndDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
     return S_OK;
 }
 
-static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, off_t off, enum fuse_fill_dir_flags flags) {
+static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, off_t off) {
     struct fuse* f = (struct fuse*)((void**)buf)[0];
     PRJ_DIR_ENTRY_BUFFER_HANDLE DirEntryBufferHandle = (PRJ_DIR_ENTRY_BUFFER_HANDLE)((void**)buf)[1];
     PCWSTR SearchExpression = (PCWSTR)((void**)buf)[2];
@@ -272,7 +279,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
                 full_path[len_path] = '/';
                 full_path[len_path + len_name + 1] = 0;
             }
-            if (!f->op.getattr(full_path, &stbuf2, finfo))
+            if (!f->op.getattr(full_path, &stbuf2))
                 stbuf = &stbuf2;
             free(full_path);
         }
@@ -326,7 +333,7 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
         data[3] = (void*)finfo;
         data[4] = (void*)(((dir_name) && (dir_name[0])) ? dir_name : "/");
 
-        res = f->op.readdir((char *)data[4], data, fuse_fill_dir, finfo->offset, finfo, 0);
+        res = f->op.readdir((char *)data[4], data, fuse_fill_dir, finfo->offset, finfo);
         free(dir_name);
 
         finfo->offset = finfo->session_offset;
@@ -346,11 +353,9 @@ HRESULT GetPlaceholderInfoCallback_C(const PRJ_CALLBACK_DATA* CallbackData) {
     if (f->op.getattr) {
         struct stat st_buf;
         memset(&st_buf, 0, sizeof(st_buf));
-        struct fuse_file_info fi;
-        memset(&fi, 0, sizeof(fi));
 
         char* path = toUTF8_path(CallbackData->FilePathName);
-        res = f->op.getattr(path, &st_buf, &fi);
+        res = f->op.getattr(path, &st_buf);
         free(path);
 
         if (!res) {
@@ -387,8 +392,6 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
 
     struct stat st_buf;
     memset(&st_buf, 0, sizeof(st_buf));
-    struct fuse_file_info fi;
-    memset(&fi, 0, sizeof(fi));
 
     char* path = toUTF8_path(CallbackData->FilePathName);
 
@@ -397,7 +400,7 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
     if ((!err) && (f->op.read)) {
         char* buffer = (char* )PrjAllocateAlignedBuffer(f->instanceHandle, Length);
         if (buffer) {
-            err = f->op.read(path, buffer, Length, (off_t)ByteOffset, &fi);
+            err = f->op.read(path, buffer, Length, (off_t)ByteOffset, guid_file_info(f, &CallbackData->DataStreamId));
             if (err > 0)
                 PrjWriteFileData(f->instanceHandle, &CallbackData->DataStreamId, buffer, ByteOffset, err);
 
@@ -432,13 +435,12 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
         return -EACCES;
 
     if (f->op.truncate) {
-        err = f->op.truncate(path, 0, finfo);
+        err = f->op.truncate(path, 0);
         if (err < 0)
             return err;
     }
 
     char buffer[8192];
-    int bytes_read = 0;
     off_t offset = 0;
     while (!feof(local_file)) {
         size_t bytes = fread(buffer, 1, sizeof(buffer), local_file);
@@ -588,7 +590,7 @@ int fuse_enable_service() {
 }
 
 
-struct fuse* fuse_new(struct fuse_args* args, const struct fuse_operations* op, size_t op_size, void* private_data) {
+struct fuse* fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operations *op, size_t op_size, void *private_data) {
     struct fuse* this_ref = (struct fuse*)malloc(sizeof(struct fuse));
     if (!this_ref)
         return NULL;
@@ -611,53 +613,88 @@ struct fuse* fuse_new(struct fuse_args* args, const struct fuse_operations* op, 
     if (op)
         this_ref->op = *op;
 
+    if (this_ref->op.init) {
+        struct fuse_config cfg = {0};
+        this_ref->op.init(&this_ref->connection, &cfg);
+    }
     this_ref->guids = kh_init(guid);
+    this_ref->user_data = private_data;
+
+    if (ch) {
+        ch->fs = this_ref;
+        this_ref->path_utf8 = toUTF8(ch->path);
+    }
+    this_ref->ch = ch;
     return this_ref;
 }
 
-int fuse_mount(struct fuse* f, const char* mountpoint) {
-    if (!f)
-        return -1;
+struct fuse_chan *fuse_mount(const char *mountpoint, void *args) {
+    const char *def_mnt = "gyro";
+    if (!mountpoint)
+        mountpoint = def_mnt;
 
+    struct fuse_chan *ch = (struct fuse_chan*)malloc(sizeof(struct fuse_chan));
+    if (!ch)
+        return NULL;
 
-    MultiByteToWideChar(CP_UTF8, 0, mountpoint, (int)strlen(mountpoint), f->path, MAX_PATH);
-    f->path_utf8 = toUTF8(f->path);
+    MultiByteToWideChar(CP_UTF8, 0, mountpoint, (int)strlen(mountpoint), ch->path, MAX_PATH);
 
     GUID instanceId;
     CreateDirectoryA(mountpoint, NULL);
-    if (FAILED(CoCreateGuid(&instanceId)))
-        return 0;
+    if (FAILED(CoCreateGuid(&instanceId))) {
+        free(ch);
+        return NULL;
+    }
 
-    PrjMarkDirectoryAsPlaceholder(f->path, NULL, NULL, &instanceId);
+    if (FAILED(PrjMarkDirectoryAsPlaceholder(ch->path, NULL, NULL, &instanceId))) {
+        free(ch);
+        return NULL;
+    }
 
-    HRESULT hr = PrjStartVirtualizing(f->path,
-        &f->callbacks,
-        f,
-        &f->options,
-        &f->instanceHandle);
+    return ch;
+}
 
+void fuse_unmount(const char *dir, struct fuse_chan *ch) {
+    // not implemented
+}
+
+int fuse_set_signal_handlers(struct fuse *se) {
+    if (!se)
+        return -1;
+
+    // not implemented
+
+    return 0;
+}
+
+struct fuse *fuse_get_session(struct fuse *f) {
+    return f;
+}
+
+void fuse_remove_signal_handlers(struct fuse *se) {
+    // not implemented
+}
+
+
+int fuse_loop(struct fuse* f) {
+    if ((!f) || (!f->ch))
+        return -1;
+
+    HRESULT hr = PrjStartVirtualizing(f->ch->path, &f->callbacks, f, &f->options, &f->instanceHandle);
     if (FAILED(hr))
         return -1;
     else
         f->running = 1;
+
+    while (f->running == 1)
+        Sleep(100);
+
+    f->running = -1;
     return 0;
 }
 
-void fuse_unmount(struct fuse* f) {
-    // not implemented
-}
-
-int fuse_loop(struct fuse* f) {
-    if (f) {
-        // wait to end
-        // I'm sure that's a better way to check if PrjStartVirtualizing threads are running
-        while (f->running == 1)
-            Sleep(100);
-
-        f->running = -1;
-        return 0;
-    }
-    return -1;
+int fuse_loop_mt(struct fuse* f) {
+    return fuse_loop(f);
 }
 
 void fuse_exit(struct fuse* f) {
@@ -669,6 +706,9 @@ void fuse_exit(struct fuse* f) {
 
 void fuse_destroy(struct fuse* f) {
     if (f) {
+        if (f->op.init)
+            f->op.destroy(f->user_data);
+
         kh_destroy(guid, f->guids);
         free(f->path_utf8);
         free(f);
