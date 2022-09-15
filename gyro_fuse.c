@@ -770,6 +770,61 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
     return HRESULT_FROM_WIN32(ret);
 }
 
+static int DeleteDirectory(const char *sPath) {
+    HANDLE hFind;
+    WIN32_FIND_DATA FindFileData;
+
+    char DirPath[MAX_PATH];
+    char FileName[MAX_PATH];
+
+    strcpy(DirPath, sPath);
+    strcat(DirPath,"\\*");
+    strcpy(FileName,sPath);
+    strcat(FileName,"\\");
+
+    hFind = FindFirstFile(DirPath, &FindFileData);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return 0;
+
+    strcpy(DirPath, FileName);
+        
+    int bSearch = 1;
+    while (bSearch) {
+        if (FindNextFile(hFind, &FindFileData)) {
+            if ((!strcmp(FindFileData.cFileName, ".")) || (!strcmp(FindFileData.cFileName,"..")))
+                continue;
+            strcat(FileName, FindFileData.cFileName);
+            if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!DeleteDirectory(FileName)) { 
+                    FindClose(hFind); 
+                    return 0;
+                }
+                RemoveDirectory(FileName);
+                strcpy(FileName, DirPath);
+            } else {
+                if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+                    _chmod(FileName, _S_IWRITE);
+                if (!DeleteFile(FileName)) {
+                    FindClose(hFind); 
+                    return 0; 
+                }                 
+                strcpy(FileName, DirPath);
+            }
+        } else {
+            if (GetLastError() == ERROR_NO_MORE_FILES) {
+                bSearch = 0;
+            } else {
+                FindClose(hFind); 
+                return 0;
+            }
+
+        }
+    }
+    FindClose(hFind);
+ 
+    return RemoveDirectory(sPath);
+}
+
 static int VirtualFS_stop(struct fuse* this_ref) {
     if (!this_ref)
         return -1;
@@ -777,6 +832,7 @@ static int VirtualFS_stop(struct fuse* this_ref) {
     this_ref->running = 0;
     PrjStopVirtualizing(this_ref->instanceHandle);
 
+    DeleteDirectory(this_ref->path_utf8);
     return 0;
 }
 
@@ -911,6 +967,7 @@ void fuse_destroy(struct fuse* f) {
         kh_destroy(guid, f->guids);
         kh_destroy(filecounter, f->files);
         free(f->path_utf8);
+
         CloseHandle(f->sem);
         free(f);
     }
