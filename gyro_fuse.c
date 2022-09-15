@@ -259,6 +259,21 @@ HRESULT EndDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
     return S_OK;
 }
 
+static PRJ_FILE_STATE GetFileState(struct fuse* f, const wchar_t *directory, const wchar_t *destinationFileName) {
+    wchar_t full_path[MAX_PATH * 3 + 3];
+
+    if ((directory) && (directory[0]))
+        _snwprintf(full_path, sizeof(full_path), L"%s/%s/%s", f->ch ? f->ch->path : L"", directory, destinationFileName ? destinationFileName : L"");
+    else
+        _snwprintf(full_path, sizeof(full_path), L"%s/%s", f->ch ? f->ch->path : L"", destinationFileName ? destinationFileName : L"");
+
+    PRJ_FILE_STATE fileState;
+    if (FAILED(PrjGetOnDiskFileState(full_path, &fileState)))
+        fileState = 0;
+
+    return fileState;
+}
+
 static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, off_t off) {
     struct fuse* f = (struct fuse*)((void**)buf)[0];
     PRJ_DIR_ENTRY_BUFFER_HANDLE DirEntryBufferHandle = (PRJ_DIR_ENTRY_BUFFER_HANDLE)((void**)buf)[1];
@@ -267,6 +282,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     PRJ_FILE_BASIC_INFO info;
     struct stat stbuf2;
     char *path = (char *)((void**)buf)[4];
+    wchar_t *wide_path = (wchar_t *)((void**)buf)[5];
 
     if ((!finfo) || (!f) || (!DirEntryBufferHandle))
         return -EIO;
@@ -320,28 +336,27 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     HRESULT err = 0;
 
     if (PrjFileNameMatch(dir, SearchExpression)) {
-        HRESULT err = PrjFillDirEntryBuffer(dir, &info, DirEntryBufferHandle);
-        if (FAILED(err)) {
-            if (err == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
-                struct dirinfo_data *dir_list_data = (struct dirinfo_data *)finfo->data;
-                if ((!dir_list_data) && (finfo->data_len >= finfo->data_allocated)) {
-                    dir_list_data = (struct dirinfo_data *)realloc(dir_list_data, sizeof(struct dirinfo_data) * (finfo->data_allocated + 0x100));
-                    if (!dir_list_data) {
-                        free(dir);
-                        return -ENOMEM;
-                    }
-                    finfo->data_allocated += 0x100;
-                    finfo->data = (void *)dir_list_data;
-                }
-
-                dir_list_data[finfo->data_len].info = info;
-                dir_list_data[finfo->data_len].name = dir;
-                finfo->data_len ++;
-                // prevent free
-                dir = NULL;
-                err = S_OK;
-            }
+        if ((!finfo->failed_buffer) && (PrjFillDirEntryBuffer(dir, &info, DirEntryBufferHandle) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)))
             finfo->failed_buffer = 1;
+
+        if (finfo->failed_buffer) {
+            struct dirinfo_data *dir_list_data = (struct dirinfo_data *)finfo->data;
+            if ((!dir_list_data) && (finfo->data_len >= finfo->data_allocated)) {
+                dir_list_data = (struct dirinfo_data *)realloc(dir_list_data, sizeof(struct dirinfo_data) * (finfo->data_allocated + 0x100));
+                if (!dir_list_data) {
+                    free(dir);
+                    return -ENOMEM;
+                }
+                finfo->data_allocated += 0x100;
+                finfo->data = (void *)dir_list_data;
+            }
+
+            dir_list_data[finfo->data_len].info = info;
+            dir_list_data[finfo->data_len].name = dir;
+            finfo->data_len ++;
+            // prevent free
+            dir = NULL;
+            err = 0;
         }
     }
     finfo->session_offset ++;
@@ -349,7 +364,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     if (dir)
         free(dir);
 
-    return err;
+    return 0;
 }
 
 HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* EnumerationId, PCWSTR SearchExpression, PRJ_DIR_ENTRY_BUFFER_HANDLE DirEntryBufferHandle) {
@@ -369,6 +384,7 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
                 HRESULT hr = PrjFillDirEntryBuffer(dir, &dir_list_data[i].info, DirEntryBufferHandle);
                 if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER))
                     break;
+
                 free(dir);
             }
             if (i) {
@@ -388,12 +404,13 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
 
         char *dir_name = toUTF8(CallbackData->FilePathName);
 
-        void* data[5];
-        data[0] = (void*)f;
+        void* data[6];
+        data[0] = (void *)f;
         data[1] = (void *)DirEntryBufferHandle;
-        data[2] = (void*)SearchExpression;
-        data[3] = (void*)finfo;
-        data[4] = (void*)(((dir_name) && (dir_name[0])) ? dir_name : "/");
+        data[2] = (void *)SearchExpression;
+        data[3] = (void *)finfo;
+        data[4] = (void *)(((dir_name) && (dir_name[0])) ? dir_name : "/");
+        data[5] = (void *)CallbackData->FilePathName;
 
         res = f->op.readdir((char *)data[4], data, fuse_fill_dir, finfo->offset, finfo);
         free(dir_name);
@@ -412,6 +429,7 @@ HRESULT GetPlaceholderInfoCallback_C(const PRJ_CALLBACK_DATA* CallbackData) {
         return S_FALSE;
 
     int res = 0;
+    struct fuse_file_info *finfo = (struct fuse_file_info *)guid_data(f, &CallbackData->FileId);
     if (f->op.getattr) {
         struct stat st_buf;
         memset(&st_buf, 0, sizeof(st_buf));
@@ -584,13 +602,13 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                 path = toUTF8_path(CallbackData->FilePathName);
                 finfo = guid_file_info(f, &CallbackData->FileId);
                 if ((NotificationType == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED) || (finfo->needs_sync)) {
-                    if ((!FAILED(PrjGetOnDiskFileState(CallbackData->FilePathName, &fileState))) && (fileState & PRJ_FILE_STATE_HYDRATED_PLACEHOLDER)) {
+                    if (GetFileState(f, NULL, CallbackData->FilePathName) & PRJ_FILE_STATE_FULL) {
                         if (f->op.write) {
                             err = fuse_sync_full_sync(f, path, CallbackData->FilePathName, finfo);
                         } else
                             err = EACCES;
+                        PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
                     }
-
                 }
                 if (f->op.release)
                     ret = f->op.release(path, finfo);
