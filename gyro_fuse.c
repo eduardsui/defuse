@@ -553,6 +553,18 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
     if (err > 0)
         err = 0;
     fclose(local_file);
+
+    if (f->op.utimens) {
+        struct stat st_buf;
+        if (!stat(full_path, &st_buf)) {
+            struct timespec tv[2];
+            tv[0].tv_sec = st_buf.st_atime;
+            tv[0].tv_nsec = 0;
+            tv[1].tv_sec = st_buf.st_mtime;
+            tv[1].tv_nsec = 0;
+            f->op.utimens(path, tv);
+        }
+    }
     return err;
 }
 
@@ -605,7 +617,7 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
             if (!IsDirectory) {
                 path = toUTF8_path(CallbackData->FilePathName);
                 finfo = guid_file_info(f, &CallbackData->FileId);
-                if ((NotificationType == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED) || (finfo->needs_sync)) {
+                if (NotificationType == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED) {
                     if (GetFileState(f, NULL, CallbackData->FilePathName) & PRJ_FILE_STATE_FULL) {
                         if (f->op.write) {
                             err = fuse_sync_full_sync(f, path, CallbackData->FilePathName, finfo);
