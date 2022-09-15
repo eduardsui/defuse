@@ -50,6 +50,9 @@ struct fuse_file_info {
 	uint64_t fh;
     off_t session_offset;
     off_t offset;
+    void *data;
+    unsigned int data_len;
+    unsigned int data_allocated;
     unsigned char failed_buffer;
     unsigned char needs_sync;
 };
