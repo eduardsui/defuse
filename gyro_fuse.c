@@ -506,7 +506,7 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
     return HRESULT_FROM_WIN32(res);
 }
 
-static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFileName, struct fuse_file_info* finfo) {
+static int fuse_sync_full_sync(struct fuse *f, char *path, PCWSTR DestinationFileName, struct fuse_file_info *finfo) {
     if (!f->op.write)
         return -EACCES;
 
@@ -520,12 +520,6 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
     FILE* local_file = fopen(full_path, "rb");
     if (!local_file)
         return -EACCES;
-
-    if (f->op.truncate) {
-        err = f->op.truncate(path, 0);
-        if (err < 0)
-            return err;
-    }
 
     char buffer[8192];
     off_t offset = 0;
@@ -554,6 +548,15 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
         err = 0;
     fclose(local_file);
 
+    if (f->op.flush)
+        f->op.flush(path, finfo);
+
+    if (f->op.fsync)
+        f->op.fsync(path, 0, finfo);
+
+    if (f->op.truncate)
+        f->op.truncate(path, offset);
+
     if (f->op.utimens) {
         struct stat st_buf;
         if (!stat(full_path, &st_buf)) {
@@ -565,6 +568,7 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
             f->op.utimens(path, tv);
         }
     }
+
     return err;
 }
 
@@ -583,6 +587,9 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
     PRJ_FILE_STATE fileState;
 
     switch (NotificationType) {
+        case PRJ_NOTIFICATION_FILE_OVERWRITTEN:
+            PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
+            // no break here
         case PRJ_NOTIFICATION_FILE_OPENED:
             ret = 0;
             if (!IsDirectory) {
@@ -606,10 +613,6 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                     ret = f->op.create(path, 0755, finfo);
                 }
             }
-            break;
-        case PRJ_NOTIFICATION_FILE_OVERWRITTEN:
-            PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
-            ret = 0;
             break;
         case PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION:
         case PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED:            
