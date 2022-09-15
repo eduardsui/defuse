@@ -507,13 +507,15 @@ HRESULT GetFileDataCallback_C(const PRJ_CALLBACK_DATA* CallbackData, UINT64 Byte
 }
 
 static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFileName, struct fuse_file_info* finfo) {
-    if ((!f->op.write) || (!finfo->needs_sync))
+    if (!f->op.write)
         return -EACCES;
 
     char full_path[4096];
     full_path[0] = 0;
 
     int err = 0;
+
+    snprintf(full_path, sizeof(full_path), "%s/%s", f->path_utf8, path);
 
     FILE* local_file = fopen(full_path, "rb");
     if (!local_file)
@@ -548,6 +550,8 @@ static int fuse_sync_full_sync(struct fuse* f, char *path, PCWSTR DestinationFil
 
         offset += written;
     }
+    if (err > 0)
+        err = 0;
     fclose(local_file);
     return err;
 }
