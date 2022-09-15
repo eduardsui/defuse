@@ -43,6 +43,8 @@ struct fuse {
     
     khash_t(guid) *guids;
     khash_t(filecounter) *files;
+
+    HANDLE sem;
 };
 
 #define LARGE_TIME(src) ((unsigned __int64)src)*10000000 + 116444736000000000LL;
@@ -106,7 +108,7 @@ static unsigned int djb2_hash(const unsigned char *str) {
     unsigned int hash = 5381;
     int c;
 
-    while (c = *str++)
+    while ( (c = *str++) )
         hash = ((hash << 5) + hash) + c;
 
     return hash;
@@ -119,9 +121,14 @@ static void* guid_data(struct fuse* f, const GUID * EnumerationId) {
     uint64_t hash = guid64(EnumerationId);
 
     void* data = NULL;
+
+    WaitForSingleObject(f->sem, INFINITE);
+
     khint_t k = kh_get(guid, f->guids, hash);
     if ((k != kh_end(f->guids)) && (kh_exist(f->guids, k)))
         data = kh_val(f->guids, k);
+
+    ReleaseSemaphore(f->sem, 1, NULL);
 
     return data;
 }
@@ -133,8 +140,13 @@ static int guid_set_data(struct fuse* f, const GUID* EnumerationId, void *data) 
     uint64_t hash = guid64(EnumerationId);
 
     int absent;
+
+    WaitForSingleObject(f->sem, INFINITE);
+
     khint_t k = kh_put(guid, f->guids, hash, &absent);
     kh_value(f->guids, k) = data;
+
+    ReleaseSemaphore(f->sem, 1, NULL);
 
     return absent;
 }
@@ -145,11 +157,17 @@ static void *guid_remove_key(struct fuse* f, const GUID* EnumerationId) {
 
     uint64_t hash = guid64(EnumerationId);
     void* data = NULL;
+
+    WaitForSingleObject(f->sem, INFINITE);
+
     khint_t k = kh_get(guid, f->guids, hash);
     if ((k != kh_end(f->guids)) && (kh_exist(f->guids, k))) {
         data = kh_val(f->guids, k);
         kh_del(guid, f->guids, k);
     }
+
+    ReleaseSemaphore(f->sem, 1, NULL);
+
     return data;
 }
 
@@ -173,18 +191,25 @@ static void file_opened(struct fuse* f, const char *name) {
     if (!name)
         return;
 
+    WaitForSingleObject(f->sem, INFINITE);
+
     unsigned int hash = djb2_hash((const unsigned char *)name);
     khint_t k = kh_get(filecounter, f->files, hash);
     if ((k != kh_end(f->files)) && (kh_exist(f->files, k))) {
         int val = kh_val(f->files, k);
         val ++;
         kh_value(f->files, k) = val;
+
+        ReleaseSemaphore(f->sem, 1, NULL);
+
         return;
     }
 
     int absent;
     k = kh_put(filecounter, f->files, hash, &absent);
     kh_value(f->files, k) = 1;
+
+    ReleaseSemaphore(f->sem, 1, NULL);
 }
 
 static int file_closed(struct fuse* f, const char *name) {
@@ -194,6 +219,9 @@ static int file_closed(struct fuse* f, const char *name) {
     int val = 0;
 
     unsigned int hash = djb2_hash((const unsigned char *)name);
+
+    WaitForSingleObject(f->sem, INFINITE);
+
     khint_t k = kh_get(filecounter, f->files, hash);
     if ((k != kh_end(f->files)) && (kh_exist(f->files, k))) {
         val = kh_val(f->files, k);
@@ -206,6 +234,8 @@ static int file_closed(struct fuse* f, const char *name) {
         if (val < 0)
             val = 0;
     }
+
+    ReleaseSemaphore(f->sem, 1, NULL);
 
     return val;
 }
@@ -337,7 +367,6 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     PRJ_FILE_BASIC_INFO info;
     struct stat stbuf2;
     char *path = (char *)((void**)buf)[4];
-    wchar_t *wide_path = (wchar_t *)((void**)buf)[5];
 
     if ((!finfo) || (!f) || (!DirEntryBufferHandle))
         return -EIO;
@@ -388,8 +417,6 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
 
     wchar_t* dir = fromUTF8(name);
 
-    HRESULT err = 0;
-
     if (PrjFileNameMatch(dir, SearchExpression)) {
         if ((!finfo->failed_buffer) && (PrjFillDirEntryBuffer(dir, &info, DirEntryBufferHandle) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)))
             finfo->failed_buffer = 1;
@@ -411,7 +438,6 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
             finfo->data_len ++;
             // prevent free
             dir = NULL;
-            err = 0;
         }
     }
     finfo->session_offset ++;
@@ -459,13 +485,12 @@ HRESULT GetDirEnumCallback_C(const PRJ_CALLBACK_DATA* CallbackData, const GUID* 
 
         char *dir_name = toUTF8(CallbackData->FilePathName);
 
-        void* data[6];
+        void* data[5];
         data[0] = (void *)f;
         data[1] = (void *)DirEntryBufferHandle;
         data[2] = (void *)SearchExpression;
         data[3] = (void *)finfo;
         data[4] = (void *)(((dir_name) && (dir_name[0])) ? dir_name : "/");
-        data[5] = (void *)CallbackData->FilePathName;
 
         res = f->op.readdir((char *)data[4], data, fuse_fill_dir, finfo->offset, finfo);
         free(dir_name);
@@ -484,7 +509,6 @@ HRESULT GetPlaceholderInfoCallback_C(const PRJ_CALLBACK_DATA* CallbackData) {
         return S_FALSE;
 
     int res = 0;
-    struct fuse_file_info *finfo = (struct fuse_file_info *)guid_data(f, &CallbackData->FileId);
     if (f->op.getattr) {
         struct stat st_buf;
         memset(&st_buf, 0, sizeof(st_buf));
@@ -639,7 +663,6 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
     int err = 0;
 
     PRJ_UPDATE_FAILURE_CAUSES err_cause = PRJ_UPDATE_FAILURE_CAUSE_NONE;
-    PRJ_FILE_STATE fileState;
 
     switch (NotificationType) {
         case PRJ_NOTIFICATION_FILE_OVERWRITTEN:
@@ -772,8 +795,8 @@ struct fuse* fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operat
     this_ref->notificationMappings[0].NotificationRoot = L"";
     this_ref->notificationMappings[0].NotificationBitMask = PRJ_NOTIFY_FILE_OPENED | PRJ_NOTIFY_NEW_FILE_CREATED | PRJ_NOTIFY_FILE_OVERWRITTEN | PRJ_NOTIFY_PRE_DELETE | PRJ_NOTIFY_PRE_RENAME | PRJ_NOTIFY_PRE_SET_HARDLINK | PRJ_NOTIFY_FILE_RENAMED | PRJ_NOTIFY_HARDLINK_CREATED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED | PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL;
 
-    this_ref->options.PoolThreadCount = 1;
-    this_ref->options.ConcurrentThreadCount = 1;
+    // this_ref->options.PoolThreadCount = 1;
+    // this_ref->options.ConcurrentThreadCount = 1;
     this_ref->options.NotificationMappings = this_ref->notificationMappings;
     this_ref->options.NotificationMappingsCount = 1;
 
@@ -800,6 +823,7 @@ struct fuse* fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operat
         this_ref->path_utf8 = toUTF8(ch->path);
     }
     this_ref->ch = ch;
+    this_ref->sem = CreateSemaphore(NULL, 1, 0xFFFF, NULL);
     return this_ref;
 }
 
@@ -887,6 +911,7 @@ void fuse_destroy(struct fuse* f) {
         kh_destroy(guid, f->guids);
         kh_destroy(filecounter, f->files);
         free(f->path_utf8);
+        CloseHandle(f->sem);
         free(f);
     }
 }
