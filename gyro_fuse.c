@@ -16,6 +16,8 @@
 #endif
 
 KHASH_MAP_INIT_INT64(guid, void *)
+// using file couneter removing local content (if removed while opened => unexpected behaviour)
+KHASH_MAP_INIT_INT(filecounter, int)
 
 struct fuse_chan {
     wchar_t path[MAX_PATH + 1];
@@ -39,7 +41,8 @@ struct fuse {
     char *path_utf8;
     char running;
     
-    khash_t(guid)* guids;
+    khash_t(guid) *guids;
+    khash_t(filecounter) *files;
 };
 
 #define LARGE_TIME(src) ((unsigned __int64)src)*10000000 + 116444736000000000LL;
@@ -99,6 +102,16 @@ static uint64_t guid64(const GUID *guid) {
     return h;
 }
 
+static unsigned int djb2_hash(const unsigned char *str) {
+    unsigned int hash = 5381;
+    int c;
+
+    while (c = *str++)
+        hash = ((hash << 5) + hash) + c;
+
+    return hash;
+}
+
 static void* guid_data(struct fuse* f, const GUID * EnumerationId) {
     if (!EnumerationId)
         return NULL;
@@ -153,6 +166,48 @@ static struct fuse_file_info *guid_file_info(struct fuse* f, const GUID* Enumera
         guid_set_data(f, EnumerationId, finfo);
     }
     return finfo;
+}
+
+
+static void file_opened(struct fuse* f, const char *name) {
+    if (!name)
+        return;
+
+    unsigned int hash = djb2_hash((const unsigned char *)name);
+    khint_t k = kh_get(filecounter, f->files, hash);
+    if ((k != kh_end(f->files)) && (kh_exist(f->files, k))) {
+        int val = kh_val(f->files, k);
+        val ++;
+        kh_value(f->files, k) = val;
+        return;
+    }
+
+    int absent;
+    k = kh_put(filecounter, f->files, hash, &absent);
+    kh_value(f->files, k) = 1;
+}
+
+static int file_closed(struct fuse* f, const char *name) {
+    if (!name)
+        return 0;
+
+    int val = 0;
+
+    unsigned int hash = djb2_hash((const unsigned char *)name);
+    khint_t k = kh_get(filecounter, f->files, hash);
+    if ((k != kh_end(f->files)) && (kh_exist(f->files, k))) {
+        val = kh_val(f->files, k);
+        val --;
+        if (val <= 0)
+            kh_del(filecounter, f->files, k);
+        else
+            kh_value(f->files, k) = val;
+
+        if (val < 0)
+            val = 0;
+    }
+
+    return val;
 }
 
 static void guid_close(struct fuse* f, const GUID* EnumerationId) {
@@ -597,6 +652,8 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                     finfo = guid_file_info(f, &CallbackData->FileId);
                     path = toUTF8_path(CallbackData->FilePathName);
                     ret = f->op.open(path, finfo);
+                    if (!ret)
+                        file_opened(f, path);
                 }
             }
             break;
@@ -611,6 +668,8 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                     finfo = guid_file_info(f, &CallbackData->FileId);
                     path = toUTF8_path(CallbackData->FilePathName);
                     ret = f->op.create(path, 0755, finfo);
+                    if (!ret)
+                        file_opened(f, path);
                 }
             }
             break;
@@ -632,7 +691,7 @@ HRESULT NotificationCallback_C(const PRJ_CALLBACK_DATA *CallbackData, BOOLEAN Is
                 if (f->op.release)
                     ret = f->op.release(path, finfo);
 
-                if (finfo->needs_sync)
+                if (!file_closed(f, path))
                     PrjDeleteFile(f->instanceHandle, CallbackData->FilePathName, PRJ_UPDATE_ALLOW_DIRTY_DATA | PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_TOMBSTONE, &err_cause);
 
                 if ((!ret) && (err))
@@ -713,8 +772,8 @@ struct fuse* fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operat
     this_ref->notificationMappings[0].NotificationRoot = L"";
     this_ref->notificationMappings[0].NotificationBitMask = PRJ_NOTIFY_FILE_OPENED | PRJ_NOTIFY_NEW_FILE_CREATED | PRJ_NOTIFY_FILE_OVERWRITTEN | PRJ_NOTIFY_PRE_DELETE | PRJ_NOTIFY_PRE_RENAME | PRJ_NOTIFY_PRE_SET_HARDLINK | PRJ_NOTIFY_FILE_RENAMED | PRJ_NOTIFY_HARDLINK_CREATED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED | PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL;
 
-    // this_ref->options.PoolThreadCount = 1;
-    // this_ref->options.ConcurrentThreadCount = 1;
+    this_ref->options.PoolThreadCount = 1;
+    this_ref->options.ConcurrentThreadCount = 1;
     this_ref->options.NotificationMappings = this_ref->notificationMappings;
     this_ref->options.NotificationMappingsCount = 1;
 
@@ -733,6 +792,7 @@ struct fuse* fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operat
         this_ref->op.init(&this_ref->connection, &cfg);
     }
     this_ref->guids = kh_init(guid);
+    this_ref->files = kh_init(filecounter);
     this_ref->user_data = private_data;
 
     if (ch) {
@@ -825,6 +885,7 @@ void fuse_destroy(struct fuse* f) {
             f->op.destroy(f->user_data);
 
         kh_destroy(guid, f->guids);
+        kh_destroy(filecounter, f->files);
         free(f->path_utf8);
         free(f);
     }
