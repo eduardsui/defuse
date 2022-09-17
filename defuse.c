@@ -2,20 +2,19 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 
+#define _WIN32_WINNT    0x0A00
+
 #include "defuse.h"
 #include "khash.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <time.h>
-#include <tchar.h>
 #include <ntstatus.h>
 #define WIN32_NO_STATUS
+#include <windows.h>
+#include <WinBase.h>
 #include <Unknwn.h>
-#include <shlwapi.h>
-#include <pathcch.h>
-#include <ShlGuid.h>
-#include <ShObjIdl_core.h>
-#include <ShlObj_core.h>
 #include <cfapi.h>
 #include <sddl.h>
 
@@ -593,12 +592,12 @@ struct fuse_chan *fuse_mount(const char *dir, void* args) {
 
     MultiByteToWideChar(CP_UTF8, 0, dir, (int)strlen(dir), ch->path, MAX_PATH);
 
-    CreateDirectory(ch->path, NULL);
+    CreateDirectoryW(ch->path, NULL);
 
     HRESULT hr = CfRegisterSyncRoot(ch->path, &CfSyncRegistration, &CfSyncPolicies, CF_REGISTER_FLAG_NONE);
     if (FAILED(hr)) {
         CfUnregisterSyncRoot(ch->path);
-        RemoveDirectory(ch->path);
+        RemoveDirectoryW(ch->path);
         free(ch);
         return NULL;
     }
@@ -640,7 +639,7 @@ int fuse_loop_mt(struct fuse* f) {
 
 static int DeleteDirectory(const wchar_t *sPath) {
     HANDLE hFind;
-    WIN32_FIND_DATA FindFileData;
+    WIN32_FIND_DATAW FindFileData;
 
     wchar_t DirPath[MAX_PATH];
     wchar_t FileName[MAX_PATH];
@@ -650,7 +649,7 @@ static int DeleteDirectory(const wchar_t *sPath) {
     wcscpy(FileName, sPath);
     wcscat(FileName, L"\\");
 
-    hFind = FindFirstFile(DirPath, &FindFileData);
+    hFind = FindFirstFileW(DirPath, &FindFileData);
     if (hFind == INVALID_HANDLE_VALUE)
         return 0;
 
@@ -658,7 +657,7 @@ static int DeleteDirectory(const wchar_t *sPath) {
 
     int bSearch = 1;
     while (bSearch) {
-        if (FindNextFile(hFind, &FindFileData)) {
+        if (FindNextFileW(hFind, &FindFileData)) {
             if ((!wcscmp(FindFileData.cFileName, L".")) || (!wcscmp(FindFileData.cFileName, L"..")))
                 continue;
             wcscat(FileName, FindFileData.cFileName);
@@ -667,13 +666,13 @@ static int DeleteDirectory(const wchar_t *sPath) {
                     FindClose(hFind);
                     return 0;
                 }
-                RemoveDirectory(FileName);
+                RemoveDirectoryW(FileName);
                 wcscpy(FileName, DirPath);
             }
             else {
                 if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
                     _wchmod(FileName, _S_IWRITE);
-                if (!DeleteFile(FileName)) {
+                if (!DeleteFileW(FileName)) {
                     FindClose(hFind);
                     return 0;
                 }
@@ -693,7 +692,7 @@ static int DeleteDirectory(const wchar_t *sPath) {
     }
     FindClose(hFind);
 
-    return RemoveDirectory(sPath);
+    return RemoveDirectoryW(sPath);
 }
 
 struct fuse* fuse_new(struct fuse_chan* ch, void* args, const struct fuse_operations* op, size_t op_size, void* private_data) {
