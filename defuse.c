@@ -473,6 +473,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     CF_PLACEHOLDER_CREATE_INFO *placeholders2 = (CF_PLACEHOLDER_CREATE_INFO *)realloc(*placeholders, sizeof(CF_PLACEHOLDER_CREATE_INFO) * ((*placeholders_count) + 1));
     if (!placeholders2)
         return -ENOMEM;
+
     *placeholders = placeholders2;
 
     CF_PLACEHOLDER_CREATE_INFO *placeholder = &placeholders2[*placeholders_count];
@@ -529,7 +530,8 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
         char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity);
         if (f->op.opendir) {
             open_err = f->op.opendir(path, &fi);
-            opParams.TransferPlaceholders.CompletionStatus = STATUS_OBJECT_PATH_NOT_FOUND;
+            if (open_err)
+                opParams.TransferPlaceholders.CompletionStatus = NTSTATUS_FROM_WIN32(-open_err);
         }
 
         if (!open_err) {
@@ -543,8 +545,9 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
                 data[4] = (void*)path;
                 data[5] = (void*)callbackParameters->FetchPlaceholders.Pattern;
 
-                if (f->op.readdir(path, data, fuse_fill_dir, fi.offset, &fi))
-                    opParams.TransferPlaceholders.CompletionStatus = STATUS_FILE_NOT_AVAILABLE;
+                int err = f->op.readdir(path, data, fuse_fill_dir, fi.offset, &fi);
+                if (err)
+                    opParams.TransferPlaceholders.CompletionStatus = NTSTATUS_FROM_WIN32(-err);
 
                 opParams.TransferPlaceholders.Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE;
                 opParams.TransferPlaceholders.PlaceholderTotalCount.QuadPart = placeholders_count;
@@ -560,7 +563,9 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
 
         free(path);
     }
+
     CfExecute(&opInfo, &opParams);
+
     unsigned int i;
     for (i = 0; i < placeholders_count; i++)
         free((void *)placeholders[i].FileIdentity);
