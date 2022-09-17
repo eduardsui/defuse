@@ -230,40 +230,61 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     opParams.TransferData.Offset.QuadPart = 0;
     opParams.TransferData.Length.QuadPart = 0;
 
-    char buf[8192];
-    if (f->op.read) {
-        size_t size = (size_t)callbackParameters->FetchData.RequiredLength.QuadPart;
-        off_t offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
+    char *buf = NULL;
+    int open_err = 0;
+    struct fuse_file_info finfo = { 0 };
+    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
 
-        if (size > sizeof(buf))
-            size = sizeof(buf);
+    if (f->op.open)
+        open_err = f->op.open(path, &finfo);
 
-        struct fuse_file_info* finfo = guid_file_info(f, callbackInfo->CorrelationVector);
-        char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
-        int err = f->op.read(path, buf, size, offset, finfo);
-        free(path);
+    if (open_err) {
+        opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(-open_err);
+    } else {
+        if (f->op.read) {
+            size_t size = (size_t)callbackParameters->FetchData.RequiredLength.QuadPart;
+            off_t offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
 
-        if (err < 0) {
-            opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(-err);
-        } else {
-            opParams.TransferData.Buffer = buf;
-            opParams.TransferData.Offset.QuadPart = offset;
-            opParams.TransferData.Length.QuadPart = err;
+            buf = (char *)malloc(size);
+            if (!buf) {
+                buf = (char *)malloc(8192);
+                if (size > 8192)
+                    size = 8192;
+            }
+
+            char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+            int err = f->op.read(path, buf, size, offset, &finfo);
+
+            free(path);
+
+            if (err < 0) {
+                opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(-err);
+                opParams.TransferData.Buffer = NULL;
+            } else {
+                opParams.TransferData.Buffer = buf;
+                opParams.TransferData.Offset.QuadPart = offset;
+                opParams.TransferData.Length.QuadPart = err;
+            }
+
+        if (f->op.release)
+            f->op.release(path, &finfo);
+
         }
     }
-
+    free(path);
     CfExecute(&opInfo, &opParams);
+    if (buf)
+        free(buf);
 }
 
 void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
-    struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
+    /* struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
     if (f->op.open) {
         char* path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
 
         struct fuse_file_info* finfo = guid_file_info(f, callbackInfo->CorrelationVector);
         f->op.open(path, finfo);
-        free(path);
-    }
+    } */
 }
 
 static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, struct fuse_file_info* finfo) {
@@ -333,10 +354,7 @@ static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, stru
 void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
     struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
 
-    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
-    struct fuse_file_info *finfo = (struct fuse_file_info *)guid_remove_key(f, callbackInfo->CorrelationVector);
-    if (f->op.release)
-        f->op.release(path, finfo);
+    struct fuse_file_info finfo = { 0 };
 
     HANDLE h;
     HRESULT hr = CfOpenFileWithOplock(callbackInfo->NormalizedPath, CF_OPEN_FILE_FLAG_EXCLUSIVE, &h);
@@ -348,10 +366,21 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBAC
         hr = CfDehydratePlaceholder(h, start, len, CF_DEHYDRATE_FLAG_NONE, NULL);
         // not in sync
         if (hr == 0x80070179) {
-            if (!(callbackParameters->CloseCompletion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED)) {
-                char* full_path = toUTF8(callbackInfo->NormalizedPath);
-                fuse_sync_full_sync(f, path, full_path, finfo);
-                free(full_path);
+            if ((!(callbackParameters->CloseCompletion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED)) && (f->op.write)){
+                char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+                int err_open = 0;
+                if (f->op.open)
+                    err_open = f->op.open(path, &finfo);
+
+                if (!err_open) {
+                    char *full_path = toUTF8(callbackInfo->NormalizedPath);
+                    fuse_sync_full_sync(f, path, full_path, &finfo);
+                    free(full_path);
+                }
+
+                if (f->op.release)
+                    f->op.release(path, &finfo);
+                free(path);
             }
         }
         if (FAILED(hr)) {
@@ -365,9 +394,6 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBAC
 
         CfCloseHandle(h);
     }
-    if (finfo)
-        free(finfo);
-    free(path);
 }
 
 void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
