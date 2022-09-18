@@ -506,7 +506,7 @@ struct fuse_chan *fuse_mount(const char *dir, void* args) {
     CfSyncRegistration.StructSize = sizeof(CF_SYNC_REGISTRATION);
     CfSyncRegistration.ProviderName = L"edwork";
     CfSyncRegistration.ProviderVersion = L"1.0";
-    CfSyncRegistration.ProviderId = { 0x328cd0f9, 0x9f45, 0x4d22, { 0x90, 0x86, 0x73, 0x8a, 0xe5, 0x83, 0x5c, 0x20 } };
+    CfSyncRegistration.ProviderId = { 0x328cd0f9, 0x9f45, 0x4d22, { 0x90, 0x86, 0x73, 0x8a, 0xe5, 0x83, 0x5c, 0x20 };
 
     CF_SYNC_POLICIES CfSyncPolicies = { 0 };
     CfSyncPolicies.StructSize = sizeof(CF_SYNC_POLICIES);
