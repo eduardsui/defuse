@@ -5,7 +5,6 @@
 #define _WIN32_WINNT    0x0A00
 
 #include "defuse.h"
-#include "khash.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -28,8 +27,6 @@
     ( FIELD_OFFSET( CF_OPERATION_PARAMETERS, field ) +                         \
       FIELD_SIZE( CF_OPERATION_PARAMETERS, field ) )
 
-KHASH_MAP_INIT_INT64(guid, void*)
-
 struct fuse_chan {
     wchar_t path[MAX_PATH + 1];
     struct fuse* fs;
@@ -42,131 +39,8 @@ struct fuse {
     void* user_data;
     char* path_utf8;
     CF_CONNECTION_KEY s_transferCallbackConnectionKey;
-
-    khash_t(guid)* guids;
-    HANDLE sem;
-
     char running;
 };
-
-static uint64_t guid64(const PCORRELATION_VECTOR vector) {
-    if (!vector)
-        return 0;
-
-    char *key = (char *)vector->Vector;
-    int len = RTL_CORRELATION_VECTOR_STRING_LENGTH;
-
-    uint64_t seed = 0;
-    const uint64_t m = 0xc6a4a7935bd1e995LLU;
-    const int r = 47;
-
-    uint64_t h = seed ^ (len * m);
-
-    const uint64_t* data = (const uint64_t*)key;
-    const uint64_t* end = data + (len / 8);
-
-    while (data != end) {
-        uint64_t k = *data++;
-
-        k *= m;
-        k ^= k >> r;
-        k *= m;
-
-        h ^= k;
-        h *= m;
-    }
-
-    const unsigned char* data2 = (const unsigned char*)data;
-
-    switch (len & 7) {
-    case 7: h ^= ((uint64_t)data2[6]) << 48;
-    case 6: h ^= ((uint64_t)data2[5]) << 40;
-    case 5: h ^= ((uint64_t)data2[4]) << 32;
-    case 4: h ^= ((uint64_t)data2[3]) << 24;
-    case 3: h ^= ((uint64_t)data2[2]) << 16;
-    case 2: h ^= ((uint64_t)data2[1]) << 8;
-    case 1: h ^= ((uint64_t)data2[0]);
-        h *= m;
-    };
-
-    h ^= h >> r;
-    h *= m;
-    h ^= h >> r;
-
-    return h;
-}
-
-static void *guid_data(struct fuse* f, const PCORRELATION_VECTOR vector) {
-    if (!vector)
-        return NULL;
-
-    uint64_t hash = guid64(vector);
-
-    void* data = NULL;
-
-    WaitForSingleObject(f->sem, INFINITE);
-
-    khint_t k = kh_get(guid, f->guids, hash);
-    if ((k != kh_end(f->guids)) && (kh_exist(f->guids, k)))
-        data = kh_val(f->guids, k);
-
-    ReleaseSemaphore(f->sem, 1, NULL);
-
-    return data;
-}
-
-static int guid_set_data(struct fuse* f, const PCORRELATION_VECTOR vector, void* data) {
-    if (!vector)
-        return 0;
-
-    uint64_t hash = guid64(vector);
-
-    int absent;
-
-    WaitForSingleObject(f->sem, INFINITE);
-
-    khint_t k = kh_put(guid, f->guids, hash, &absent);
-    kh_value(f->guids, k) = data;
-
-    ReleaseSemaphore(f->sem, 1, NULL);
-
-    return absent;
-}
-
-static void *guid_remove_key(struct fuse* f, const PCORRELATION_VECTOR vector) {
-    if (!vector)
-        return NULL;
-
-    uint64_t hash = guid64(vector);
-    void* data = NULL;
-
-    WaitForSingleObject(f->sem, INFINITE);
-
-    khint_t k = kh_get(guid, f->guids, hash);
-    if ((k != kh_end(f->guids)) && (kh_exist(f->guids, k))) {
-        data = kh_val(f->guids, k);
-        kh_del(guid, f->guids, k);
-    }
-
-    ReleaseSemaphore(f->sem, 1, NULL);
-
-    return data;
-}
-
-static struct fuse_file_info* guid_file_info(struct fuse* f, const PCORRELATION_VECTOR vector) {
-    if (!vector)
-        return NULL;
-
-    struct fuse_file_info* finfo = (struct fuse_file_info*)guid_data(f, vector);
-    if (!finfo) {
-        finfo = (struct fuse_file_info*)malloc(sizeof(struct fuse_file_info));
-        if (!finfo)
-            return NULL;
-        memset(finfo, 0, sizeof(struct fuse_file_info));
-        guid_set_data(f, vector, finfo);
-    }
-    return finfo;
-}
 
 static char *toUTF8(const wchar_t* src) {
     if (!src)
@@ -215,6 +89,20 @@ static wchar_t *fromUTF8(const char* src) {
     return buf;
 }
 
+int fuse_is_read_only(struct fuse *f, const char *path) {
+    int read_only = 0;
+
+    if ((f) && (f->op.statfs)) {
+        struct statvfs stbuf;
+
+        if (!f->op.statfs(path, &stbuf)) {
+            if ((!stbuf.f_bfree) || (!stbuf.f_bavail ) || (!stbuf.f_ffree) || (!stbuf.f_favail))
+                read_only = 1;
+        }
+    }
+    return read_only;
+}
+
 void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     struct fuse* f = (struct fuse*)callbackInfo->CallbackContext;
 
@@ -238,7 +126,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
         open_err = f->op.open(path, &finfo);
 
     if (open_err) {
-        opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(-open_err);
+        opParams.TransferData.CompletionStatus = STATUS_UNSUCCESSFUL;
     } else {
         if (f->op.read) {
             size_t size = (size_t)callbackParameters->FetchData.RequiredLength.QuadPart;
@@ -251,7 +139,6 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 
             do {
                 int err = f->op.read(path, buf, read_size, offset, &finfo);
-
                 if (err < 0) {
                     opParams.TransferData.CompletionStatus = STATUS_UNSUCCESSFUL;
                     opParams.TransferData.Buffer = NULL;
@@ -283,13 +170,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 }
 
 void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
-    /* struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
-    if (f->op.open) {
-        char* path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
-
-        struct fuse_file_info* finfo = guid_file_info(f, callbackInfo->CorrelationVector);
-        f->op.open(path, finfo);
-    } */
+    // to do
 }
 
 static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, struct fuse_file_info* finfo) {
@@ -356,7 +237,7 @@ static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, stru
     return err;
 }
 
-void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
+void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
 
     struct fuse_file_info finfo = { 0 };
@@ -373,22 +254,25 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBAC
         if (hr == 0x80070179) {
             if ((!(callbackParameters->CloseCompletion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED)) && (f->op.write)){
                 char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
-                int err_open = 0;
-                if (f->op.open)
-                    err_open = f->op.open(path, &finfo);
+                if (!fuse_is_read_only(f, path)) {
+                    int err_open = 0;
+                    if (f->op.open)
+                        err_open = f->op.open(path, &finfo);
 
-                if (!err_open) {
-                    char *full_path = toUTF8(callbackInfo->NormalizedPath);
-                    fuse_sync_full_sync(f, path, full_path, &finfo);
-                    free(full_path);
-                    // SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, callbackInfo->NormalizedPath, NULL);
+                    if (!err_open) {
+                        char *full_path = toUTF8(callbackInfo->NormalizedPath);
+                        fuse_sync_full_sync(f, path, full_path, &finfo);
+                        free(full_path);
+                        // SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, callbackInfo->NormalizedPath, NULL);
+                    }
+
+                    if (f->op.release)
+                        f->op.release(path, &finfo);
                 }
-
-                if (f->op.release)
-                    f->op.release(path, &finfo);
                 free(path);
             }
         }
+
         if (FAILED(hr)) {
             CfCloseHandle(h);
 
@@ -405,22 +289,19 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBAC
 void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
     int err = -1;
-    char *path;
-    if (callbackParameters->Delete.Flags == CF_CALLBACK_DELETE_FLAG_NONE) {
-        if (f->op.unlink) {
-            path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
-            err = f->op.unlink(path);
-            free(path);
-        }
-    } else
-    if (callbackParameters->Delete.Flags == CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY) {
-        if (f->op.rmdir) {
-            path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
-            err = f->op.rmdir(path);
-            free(path);
+
+    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+    if (!fuse_is_read_only(f, path)) {
+        if (callbackParameters->Delete.Flags & CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY) {
+            if (f->op.rmdir)
+                err = f->op.rmdir(path);
+        } else {
+            if (f->op.unlink)
+                err = f->op.unlink(path);
         }
     }
-
+    free(path);
+    
     CF_OPERATION_INFO opInfo = { 0 };
     CF_OPERATION_PARAMETERS opParams = { 0 };
 
@@ -429,7 +310,7 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(AckDelete);
-    opParams.AckDelete.CompletionStatus = err ? NTSTATUS_FROM_WIN32(-err) : STATUS_SUCCESS;
+    opParams.AckDelete.CompletionStatus = err ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
     opParams.AckDelete.Flags = CF_OPERATION_ACK_DELETE_FLAG_NONE;
 
     CfExecute(&opInfo, &opParams);
@@ -438,9 +319,10 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
 void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     struct fuse* f = (struct fuse*)callbackInfo->CallbackContext;
     int err = -1;
-    char *path;
+    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
     char *path2;
-    if (f->op.rename) {
+
+    if ((f->op.rename) && (!fuse_is_read_only(f, path))) {
         path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
         path2 = toUTF8_path(callbackParameters->Rename.TargetPath, callbackParameters->Rename.TargetPath ? wcslen(callbackParameters->Rename.TargetPath) : 0);
         err = f->op.rename(path, path2, 0);
@@ -456,7 +338,7 @@ void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(AckRename);
-    opParams.AckRename.CompletionStatus = err ? NTSTATUS_FROM_WIN32(-err) : STATUS_SUCCESS;
+    opParams.AckRename.CompletionStatus = err ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
     opParams.AckRename.Flags = CF_OPERATION_ACK_RENAME_FLAG_NONE;
 
     CfExecute(&opInfo, &opParams);
@@ -518,7 +400,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     placeholder->FileIdentityLength = (DWORD)(wcslen(wname) * sizeof(wchar_t));
     placeholder->RelativeFileName = wname;
 
-    placeholder->Flags = CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
+    placeholder->Flags = CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC | CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE;
     if (stbuf) {
         if (S_ISDIR(stbuf->st_mode))
             placeholder->FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
@@ -540,7 +422,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     return 0;
 }
 
-void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
+void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     CF_OPERATION_INFO opInfo = { 0 };
     CF_OPERATION_PARAMETERS opParams = { 0 };
 
@@ -560,6 +442,7 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
         struct fuse_file_info fi = { 0 };
         int open_err = 0;
         char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+
         if (f->op.opendir) {
             open_err = f->op.opendir(path, &fi);
             if (open_err)
@@ -579,13 +462,13 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
 
                 int err = f->op.readdir(path, data, fuse_fill_dir, fi.offset, &fi);
                 if (err)
-                    opParams.TransferPlaceholders.CompletionStatus = NTSTATUS_FROM_WIN32(-err);
+                    opParams.TransferPlaceholders.CompletionStatus = STATUS_UNSUCCESSFUL;
 
                 opParams.TransferPlaceholders.Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE;
                 opParams.TransferPlaceholders.PlaceholderTotalCount.QuadPart = placeholders_count;
 
                 opParams.TransferPlaceholders.PlaceholderCount = placeholders_count;
-                opParams.TransferPlaceholders.EntriesProcessed = placeholders_count;
+                // opParams.TransferPlaceholders.EntriesProcessed = 0;
                 opParams.TransferPlaceholders.PlaceholderArray = placeholders;
             }
 
@@ -604,8 +487,12 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
     free(placeholders);
 }
 
+void CALLBACK OnValidateData(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
+    // to do
+}
+
 struct fuse_chan *fuse_mount(const char *dir, void* args) {
-    const char* def_mnt = "gyro";
+    const char* def_mnt = "defuse";
     if (!dir)
         dir = def_mnt;
 
@@ -624,8 +511,11 @@ struct fuse_chan *fuse_mount(const char *dir, void* args) {
     CfSyncPolicies.StructSize = sizeof(CF_SYNC_POLICIES);
     CfSyncPolicies.HardLink = CF_HARDLINK_POLICY_NONE;
     CfSyncPolicies.Hydration.Primary = CF_HYDRATION_POLICY_PARTIAL;
+    CfSyncPolicies.Hydration.Modifier = CF_HYDRATION_POLICY_PARTIAL;
     CfSyncPolicies.InSync = CF_INSYNC_POLICY_TRACK_ALL;
     CfSyncPolicies.Population.Primary = CF_POPULATION_POLICY_PARTIAL;
+    CfSyncPolicies.Population.Modifier = CF_POPULATION_POLICY_PARTIAL;
+    CfSyncPolicies.PlaceholderManagement = CF_PLACEHOLDER_MANAGEMENT_POLICY_CREATE_UNRESTRICTED | CF_PLACEHOLDER_MANAGEMENT_POLICY_CONVERT_TO_UNRESTRICTED | CF_PLACEHOLDER_MANAGEMENT_POLICY_UPDATE_UNRESTRICTED;
 
     MultiByteToWideChar(CP_UTF8, 0, dir, (int)strlen(dir), ch->path, MAX_PATH);
 
@@ -650,6 +540,7 @@ int fuse_loop(struct fuse* f) {
         { CF_CALLBACK_TYPE_NOTIFY_DELETE, OnFileDelete },
         { CF_CALLBACK_TYPE_NOTIFY_RENAME, OnFileRename },
         { CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, OnFetchPlaceholders },
+        { CF_CALLBACK_TYPE_VALIDATE_DATA, OnValidateData },
         CF_CALLBACK_REGISTRATION_END
     };
 
@@ -756,9 +647,6 @@ struct fuse* fuse_new(struct fuse_chan* ch, void* args, const struct fuse_operat
         this_ref->path_utf8 = toUTF8(ch->path);
     }
     this_ref->ch = ch;
-    this_ref->guids = kh_init(guid);
-    this_ref->sem = CreateSemaphore(NULL, 1, 0xFFFF, NULL);
-
     return this_ref;
 }
 
@@ -806,9 +694,7 @@ void fuse_destroy(struct fuse* f) {
         if (f->op.init)
             f->op.destroy(f->user_data);
 
-        kh_destroy(guid, f->guids);
         free(f->path_utf8);
-        CloseHandle(f->sem);
         free(f);
     }
 }
