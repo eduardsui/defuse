@@ -127,10 +127,13 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 
     if (open_err) {
         opParams.TransferData.CompletionStatus = STATUS_UNSUCCESSFUL;
+        CfExecute(&opInfo, &opParams);
     } else {
         if (f->op.read) {
             size_t size = (size_t)callbackParameters->FetchData.RequiredLength.QuadPart;
             off_t offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
+
+            LARGE_INTEGER ProviderProgressCompleted = { 0 };
 
             char buf[8192];
             int read_size = size;
@@ -144,21 +147,25 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
                     opParams.TransferData.Buffer = NULL;
                     opParams.TransferData.Offset.QuadPart = offset;
                     opParams.TransferData.Length.QuadPart = 0;
-
                     break;
                 } else {
                     opParams.TransferData.Buffer = buf;
                     opParams.TransferData.Offset.QuadPart = offset;
                     opParams.TransferData.Length.QuadPart = err;
                     
-                    HRESULT hr = CfExecute(&opInfo, &opParams);
-                    if (FAILED(hr))
-                        break;
+                    CfExecute(&opInfo, &opParams);
+
+                    opParams.TransferData.CompletionStatus = STATUS_SUCCESS;
+                    ProviderProgressCompleted.QuadPart += err;
+                    CfReportProviderProgress(callbackInfo->ConnectionKey, callbackInfo->TransferKey, callbackParameters->FetchData.RequiredLength, ProviderProgressCompleted);
+
 
                     size -= err;
                     offset += err;
-                }
 
+                    if (size < read_size)
+                        read_size = size;
+                }
             } while (size > 0);
         }
 
@@ -173,18 +180,80 @@ void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK
     // to do
 }
 
-static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, struct fuse_file_info* finfo) {
+static int is_modified(struct fuse* f, char* path, char *full_path) {
+    struct stat st_buf = { 0 };
+
+    FILE* local_file = NULL;
+    
+    int err = fopen_s(&local_file, full_path, "rb");
+    if (!local_file)
+        return 0;
+
+    __int64 fuse_file_size = 0;
+    int has_stat = 0;
+    if ((f->op.getattr) && (!f->op.getattr(path, &st_buf))) {
+        fuse_file_size = st_buf.st_size;
+        has_stat = 1;
+    }
+
+    _fseeki64(local_file, 0, SEEK_END);
+    __int64 fsize = _ftelli64(local_file);
+    _fseeki64(local_file, 0, SEEK_SET);
+
+    if ((fuse_file_size == fsize) && (has_stat)) {
+        struct stat st_buf2 = { 0 };
+
+        if (!stat(full_path, &st_buf2)) {
+            if (st_buf.st_mtime == st_buf2.st_mtime) {
+                // no change
+                fclose(local_file);
+                return 0;
+            }
+        }
+    }
+
+    fclose(local_file);
+    return 1;
+}
+
+static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path) {
+    struct fuse_file_info finfo = { 0 };
+
     if (!f->op.write)
         return -EACCES;
 
     int err = 0;
+    struct stat st_buf = { 0 };
 
     FILE* local_file = NULL;
-    
     
     err = fopen_s(&local_file, full_path, "rb");
     if (!local_file)
         return -EACCES;
+
+    if (f->op.truncate) {
+        __int64 fuse_file_size = 0;
+        int has_stat = 0;
+        if ((f->op.getattr) && (!f->op.getattr(path, &st_buf))) {
+            fuse_file_size = st_buf.st_size;
+            has_stat = 1;
+        }
+
+        _fseeki64(local_file, 0, SEEK_END);
+        __int64 fsize = _ftelli64(local_file);
+        _fseeki64(local_file, 0, SEEK_SET);
+
+        if (fsize < fuse_file_size)
+            f->op.truncate(path, fsize);
+    }
+
+    if (f->op.open) {
+        err = f->op.open(path, &finfo);
+        if (err) {
+            fclose(local_file);
+            return err;
+        }
+    }
 
     char buffer[8192];
     off_t offset = 0;
@@ -195,9 +264,11 @@ static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, stru
                 err = -EIO;
             break;
         }
+        buffer[bytes] = 0;
+
         off_t written = 0;
         do {
-            err = f->op.write(path, buffer + written, bytes - written, offset + written, finfo);
+            err = f->op.write(path, buffer + written, bytes - written, offset + written, &finfo);
             if (err <= 0)
                 break;
 
@@ -214,16 +285,12 @@ static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, stru
     fclose(local_file);
 
     if (f->op.flush)
-        f->op.flush(path, finfo);
+        f->op.flush(path, &finfo);
 
     if (f->op.fsync)
-        f->op.fsync(path, 0, finfo);
-
-    if (f->op.truncate)
-        f->op.truncate(path, offset);
+        f->op.fsync(path, 0, &finfo);
 
     if (f->op.utimens) {
-        struct stat st_buf;
         if (!stat(full_path, &st_buf)) {
             struct timespec tv[2];
             tv[0].tv_sec = st_buf.st_atime;
@@ -234,13 +301,14 @@ static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path, stru
         }
     }
 
+    if (f->op.release)
+        f->op.release(path, &finfo);
+
     return err;
 }
 
 void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
-
-    struct fuse_file_info finfo = { 0 };
 
     HANDLE h;
     HRESULT hr = CfOpenFileWithOplock(callbackInfo->NormalizedPath, CF_OPEN_FILE_FLAG_EXCLUSIVE, &h);
@@ -252,25 +320,24 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
         hr = CfDehydratePlaceholder(h, start, len, CF_DEHYDRATE_FLAG_NONE, NULL);
         // not in sync
         if (hr == 0x80070179) {
-            if ((!(callbackParameters->CloseCompletion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED)) && (f->op.write)){
-                char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
-                if (!fuse_is_read_only(f, path)) {
-                    int err_open = 0;
-                    if (f->op.open)
-                        err_open = f->op.open(path, &finfo);
-
-                    if (!err_open) {
-                        char *full_path = toUTF8(callbackInfo->NormalizedPath);
-                        fuse_sync_full_sync(f, path, full_path, &finfo);
-                        free(full_path);
-                        // SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, callbackInfo->NormalizedPath, NULL);
-                    }
-
-                    if (f->op.release)
-                        f->op.release(path, &finfo);
-                }
+            char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+            char *full_path = toUTF8(callbackInfo->NormalizedPath);
+            if (!is_modified(f, path, full_path)) {
+                CfCloseHandle(h);
+                CfOpenFileWithOplock(callbackInfo->NormalizedPath, CF_OPEN_FILE_FLAG_EXCLUSIVE, &h);
+                CfSetInSyncState(h, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, NULL);
+                CfCloseHandle(h);
                 free(path);
+                free(full_path);
+                return;
             }
+            CfOpenFileWithOplock(callbackInfo->NormalizedPath, CF_OPEN_FILE_FLAG_EXCLUSIVE, &h);
+            if ((!(callbackParameters->CloseCompletion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED)) && (f->op.write)) {
+                if (!fuse_is_read_only(f, path))
+                    fuse_sync_full_sync(f, path, full_path);
+            }
+            free(full_path);
+            free(path);
         }
 
         if (FAILED(hr)) {
@@ -400,7 +467,7 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     placeholder->FileIdentityLength = (DWORD)(wcslen(wname) * sizeof(wchar_t));
     placeholder->RelativeFileName = wname;
 
-    placeholder->Flags = CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC | CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE;
+    placeholder->Flags = CF_PLACEHOLDER_CREATE_FLAG_NONE;
     if (stbuf) {
         if (S_ISDIR(stbuf->st_mode))
             placeholder->FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
@@ -430,6 +497,8 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
     opInfo.Type = CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS;
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
+    opInfo.RequestKey = callbackInfo->RequestKey;
+
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(TransferPlaceholders);
     opParams.TransferPlaceholders.CompletionStatus = STATUS_SUCCESS;
     struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
@@ -464,11 +533,9 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
                 if (err)
                     opParams.TransferPlaceholders.CompletionStatus = STATUS_UNSUCCESSFUL;
 
-                opParams.TransferPlaceholders.Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE;
+                opParams.TransferPlaceholders.Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE;//CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION;
                 opParams.TransferPlaceholders.PlaceholderTotalCount.QuadPart = placeholders_count;
-
                 opParams.TransferPlaceholders.PlaceholderCount = placeholders_count;
-                // opParams.TransferPlaceholders.EntriesProcessed = 0;
                 opParams.TransferPlaceholders.PlaceholderArray = placeholders;
             }
 
@@ -511,11 +578,11 @@ struct fuse_chan *fuse_mount(const char *dir, void* args) {
     CF_SYNC_POLICIES CfSyncPolicies = { 0 };
     CfSyncPolicies.StructSize = sizeof(CF_SYNC_POLICIES);
     CfSyncPolicies.HardLink = CF_HARDLINK_POLICY_NONE;
-    CfSyncPolicies.Hydration.Primary = CF_HYDRATION_POLICY_PARTIAL;
-    CfSyncPolicies.Hydration.Modifier = CF_HYDRATION_POLICY_PARTIAL;
-    CfSyncPolicies.InSync = CF_INSYNC_POLICY_TRACK_ALL;
-    CfSyncPolicies.Population.Primary = CF_POPULATION_POLICY_PARTIAL;
-    CfSyncPolicies.Population.Modifier = CF_POPULATION_POLICY_PARTIAL;
+    CfSyncPolicies.Hydration.Primary = CF_HYDRATION_POLICY_PROGRESSIVE;
+    CfSyncPolicies.Hydration.Modifier = CF_HYDRATION_POLICY_MODIFIER_STREAMING_ALLOWED | CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED;
+    CfSyncPolicies.InSync = CF_INSYNC_POLICY_TRACK_FILE_LAST_WRITE_TIME | CF_INSYNC_POLICY_TRACK_DIRECTORY_LAST_WRITE_TIME;
+    CfSyncPolicies.Population.Primary = CF_POPULATION_POLICY_FULL;
+    CfSyncPolicies.Population.Modifier = CF_POPULATION_POLICY_MODIFIER_NONE;
     CfSyncPolicies.PlaceholderManagement = CF_PLACEHOLDER_MANAGEMENT_POLICY_CREATE_UNRESTRICTED | CF_PLACEHOLDER_MANAGEMENT_POLICY_CONVERT_TO_UNRESTRICTED | CF_PLACEHOLDER_MANAGEMENT_POLICY_UPDATE_UNRESTRICTED;
 
     MultiByteToWideChar(CP_UTF8, 0, dir, (int)strlen(dir), ch->path, MAX_PATH);
