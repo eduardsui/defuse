@@ -182,14 +182,14 @@ static char *toUTF8(const wchar_t* src) {
     return buf;
 }
 
-static char *toUTF8_path(const wchar_t* src) {
-    if ((!src) || (!src[0]))
+static char *toUTF8_path(const wchar_t* src, int bytes_len) {
+    if ((!src) || (!src[0]) || (bytes_len <= 0))
         return _strdup("/");
 
     int add_path = 0;
     if (src[0] != '/')
         add_path = 1;
-    int len = (int)wcslen(src);
+    int len = bytes_len / 2;
     int utf8_len = WideCharToMultiByte(CP_UTF8, 0, src, len, 0, 0, NULL, NULL);
     char* buf = (char*)malloc((utf8_len + add_path + 1) * sizeof(char));
     if (buf) {
@@ -230,10 +230,9 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     opParams.TransferData.Offset.QuadPart = 0;
     opParams.TransferData.Length.QuadPart = 0;
 
-    char *buf = NULL;
     int open_err = 0;
     struct fuse_file_info finfo = { 0 };
-    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
 
     if (f->op.open)
         open_err = f->op.open(path, &finfo);
@@ -245,42 +244,48 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
             size_t size = (size_t)callbackParameters->FetchData.RequiredLength.QuadPart;
             off_t offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
 
-            buf = (char *)malloc(size);
-            if (!buf) {
-                buf = (char *)malloc(8192);
-                if (size > 8192)
-                    size = 8192;
-            }
+            char buf[8192];
+            int read_size = size;
+            if (read_size > sizeof(buf))
+                read_size = sizeof(buf);
 
-            char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
-            int err = f->op.read(path, buf, size, offset, &finfo);
+            do {
+                int err = f->op.read(path, buf, read_size, offset, &finfo);
 
-            free(path);
+                if (err < 0) {
+                    opParams.TransferData.CompletionStatus = STATUS_UNSUCCESSFUL;
+                    opParams.TransferData.Buffer = NULL;
+                    opParams.TransferData.Offset.QuadPart = offset;
+                    opParams.TransferData.Length.QuadPart = 0;
 
-            if (err < 0) {
-                opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(-err);
-                opParams.TransferData.Buffer = NULL;
-            } else {
-                opParams.TransferData.Buffer = buf;
-                opParams.TransferData.Offset.QuadPart = offset;
-                opParams.TransferData.Length.QuadPart = err;
-            }
+                    break;
+                } else {
+                    opParams.TransferData.Buffer = buf;
+                    opParams.TransferData.Offset.QuadPart = offset;
+                    opParams.TransferData.Length.QuadPart = err;
+                    
+                    HRESULT hr = CfExecute(&opInfo, &opParams);
+                    if (FAILED(hr))
+                        break;
+
+                    size -= err;
+                    offset += err;
+                }
+
+            } while (size > 0);
+        }
 
         if (f->op.release)
             f->op.release(path, &finfo);
-
-        }
     }
+
     free(path);
-    CfExecute(&opInfo, &opParams);
-    if (buf)
-        free(buf);
 }
 
 void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
     /* struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
     if (f->op.open) {
-        char* path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+        char* path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
 
         struct fuse_file_info* finfo = guid_file_info(f, callbackInfo->CorrelationVector);
         f->op.open(path, finfo);
@@ -367,7 +372,7 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBAC
         // not in sync
         if (hr == 0x80070179) {
             if ((!(callbackParameters->CloseCompletion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED)) && (f->op.write)){
-                char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+                char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
                 int err_open = 0;
                 if (f->op.open)
                     err_open = f->op.open(path, &finfo);
@@ -376,6 +381,7 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBAC
                     char *full_path = toUTF8(callbackInfo->NormalizedPath);
                     fuse_sync_full_sync(f, path, full_path, &finfo);
                     free(full_path);
+                    // SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, callbackInfo->NormalizedPath, NULL);
                 }
 
                 if (f->op.release)
@@ -402,14 +408,14 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     char *path;
     if (callbackParameters->Delete.Flags == CF_CALLBACK_DELETE_FLAG_NONE) {
         if (f->op.unlink) {
-            path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+            path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
             err = f->op.unlink(path);
             free(path);
         }
     } else
     if (callbackParameters->Delete.Flags == CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY) {
         if (f->op.rmdir) {
-            path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
+            path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
             err = f->op.rmdir(path);
             free(path);
         }
@@ -435,8 +441,8 @@ void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     char *path;
     char *path2;
     if (f->op.rename) {
-        path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity);
-        path2 = toUTF8_path(callbackParameters->Rename.TargetPath);
+        path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+        path2 = toUTF8_path(callbackParameters->Rename.TargetPath, callbackParameters->Rename.TargetPath ? wcslen(callbackParameters->Rename.TargetPath) : 0);
         err = f->op.rename(path, path2, 0);
         free(path);
         free(path2);
@@ -553,11 +559,11 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF
 
         struct fuse_file_info fi = { 0 };
         int open_err = 0;
-        char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity);
+        char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
         if (f->op.opendir) {
             open_err = f->op.opendir(path, &fi);
             if (open_err)
-                opParams.TransferPlaceholders.CompletionStatus = NTSTATUS_FROM_WIN32(-open_err);
+                opParams.TransferPlaceholders.CompletionStatus = STATUS_UNSUCCESSFUL;
         }
 
         if (!open_err) {
