@@ -114,6 +114,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
     opInfo.RequestKey = callbackInfo->RequestKey;
+    opInfo.CorrelationVector = callbackInfo->CorrelationVector;
 
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(TransferData);
     opParams.TransferData.CompletionStatus = STATUS_SUCCESS;
@@ -382,6 +383,9 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     opInfo.Type = CF_OPERATION_TYPE_ACK_DELETE;
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
+    opInfo.CorrelationVector = callbackInfo->CorrelationVector;
+    opInfo.RequestKey = callbackInfo->RequestKey;
+
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(AckDelete);
     opParams.AckDelete.CompletionStatus = err ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
     opParams.AckDelete.Flags = CF_OPERATION_ACK_DELETE_FLAG_NONE;
@@ -410,6 +414,9 @@ void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     opInfo.Type = CF_OPERATION_TYPE_ACK_RENAME;
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
+    opInfo.CorrelationVector = callbackInfo->CorrelationVector;
+    opInfo.RequestKey = callbackInfo->RequestKey;
+
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(AckRename);
     opParams.AckRename.CompletionStatus = err ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
     opParams.AckRename.Flags = CF_OPERATION_ACK_RENAME_FLAG_NONE;
@@ -507,6 +514,7 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
     opInfo.RequestKey = callbackInfo->RequestKey;
+    opInfo.CorrelationVector = callbackInfo->CorrelationVector;
 
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(TransferPlaceholders);
     opParams.TransferPlaceholders.CompletionStatus = STATUS_SUCCESS;
@@ -669,19 +677,14 @@ static int DeleteDirectory(const wchar_t *sPath) {
                 continue;
             wcscat(FileName, FindFileData.cFileName);
             if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (!DeleteDirectory(FileName)) {
-                    FindClose(hFind);
-                    return 0;
-                }
+                DeleteDirectory(FileName);
                 RemoveDirectoryW(FileName);
                 wcscpy(FileName, DirPath);
             } else {
                 if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
                     _wchmod(FileName, _S_IWRITE);
-                if (!DeleteFileW(FileName)) {
-                    FindClose(hFind);
-                    return 0;
-                }
+
+                DeleteFileW(FileName);
                 wcscpy(FileName, DirPath);
             }
         } else {
