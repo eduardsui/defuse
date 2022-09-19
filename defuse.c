@@ -151,7 +151,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
                     opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(EIO);
                     opParams.TransferData.Buffer = buf;
                     opParams.TransferData.Offset.QuadPart = offset;
-                    opParams.TransferData.Length.QuadPart = read_size;
+                    opParams.TransferData.Length.QuadPart = size;
 
                     CfExecute(&opInfo, &opParams);
                     break;
