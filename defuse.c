@@ -65,7 +65,7 @@ static char *toUTF8_path(const wchar_t *src, int bytes_len) {
         add_path = 1;
     int len = bytes_len / 2;
     int utf8_len = WideCharToMultiByte(CP_UTF8, 0, src, len, 0, 0, NULL, NULL);
-    char* buf = (char*)malloc((utf8_len + add_path + 1) * sizeof(char));
+    char *buf = (char *)malloc((utf8_len + add_path + 1) * sizeof(char));
     if (buf) {
         WideCharToMultiByte(CP_UTF8, 0, src, len, buf + add_path, utf8_len, NULL, NULL);
         if (add_path)
@@ -126,17 +126,21 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     if (f->op.open)
         open_err = f->op.open(path, &finfo);
 
+    char buf[8192];
     if (open_err) {
+        opParams.TransferData.Buffer = buf;
+        opParams.TransferData.Offset.QuadPart = callbackParameters->FetchData.RequiredFileOffset.QuadPart;
+        opParams.TransferData.Length.QuadPart = callbackParameters->FetchData.RequiredLength.QuadPart;
         opParams.TransferData.CompletionStatus = STATUS_UNSUCCESSFUL;
+
         CfExecute(&opInfo, &opParams);
     } else {
         if (f->op.read) {
             __int64 size = (__int64)callbackParameters->FetchData.RequiredLength.QuadPart;
-            __int64 offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
+            __int64 offset = (__int64)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
 
             LARGE_INTEGER ProviderProgressCompleted = { 0 };
 
-            char buf[8192];
             __int64 read_size = size;
             if (read_size > sizeof(buf))
                 read_size = sizeof(buf);
@@ -429,26 +433,29 @@ static int fuse_fill_dir(void *buf, const char *name, const struct stat *stbuf, 
     if (off < finfo->offset)
         return 0;
 
+    int len_name = name ? (int)strlen(name) : 0;
+    int len_path = path ? (int)strlen(path) : 0;
+    char* full_path = (char*)malloc(len_path + len_name + 2);
+
+    if (full_path) {
+        memcpy(full_path, path, len_path);
+        if (path[len_path - 1] == '/') {
+            memcpy(full_path + len_path, name, len_name);
+            full_path[len_path + len_name] = 0;
+        } else {
+            full_path[len_path] = '/';
+            memcpy(full_path + len_path + 1, name, len_name);
+            full_path[len_path + len_name + 1] = 0;
+        }
+    }
+
     if ((!stbuf) && (f->op.getattr) && (name) && (path) && (path[0])) {
         memset(&stbuf2, 0, sizeof(stbuf2));
-        if ((!strcmp(name, ".")) && (!strcmp(name, ".."))) {
-            int len_name = (int)strlen(name);
-            int len_path = (int)strlen(path);
-            char* full_path = (char*)malloc(len_path + len_name + 2);
-            if (full_path) {
-                memcpy(full_path, path, len_path);
-                if (path[len_path - 1] == '/') {
-                    memcpy(full_path + len_path, name, len_name);
-                    full_path[len_path + len_name] = 0;
-                } else {
-                        memcpy(full_path + len_path + 1, name, len_name);
-                        full_path[len_path] = '/';
-                        full_path[len_path + len_name + 1] = 0;
-                }
-                free(full_path);
-            }
-        } else {
+        if ((!strcmp(name, ".")) || (!strcmp(name, ".."))) {
             if (!f->op.getattr(path, &stbuf2))
+                stbuf = &stbuf2;
+        } else {
+            if (!f->op.getattr(full_path, &stbuf2))
                 stbuf = &stbuf2;
         }
     }
@@ -463,10 +470,12 @@ static int fuse_fill_dir(void *buf, const char *name, const struct stat *stbuf, 
 
     memset(placeholder, 0, sizeof(CF_PLACEHOLDER_CREATE_INFO));
 
-    wchar_t* wname = fromUTF8(name);
+    wchar_t* wname = fromUTF8(full_path);
     placeholder->FileIdentity = wname;
     placeholder->FileIdentityLength = (DWORD)(wcslen(wname) * sizeof(wchar_t));
-    placeholder->RelativeFileName = wname;
+    placeholder->RelativeFileName = fromUTF8(name);
+
+    // do not free wname nor placeholder->RelativeFileName here (it will be freed by OnFetchPlaceholders)
 
     placeholder->Flags = CF_PLACEHOLDER_CREATE_FLAG_NONE;
     if (stbuf) {
@@ -550,8 +559,10 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
     CfExecute(&opInfo, &opParams);
 
     unsigned int i;
-    for (i = 0; i < placeholders_count; i++)
+    for (i = 0; i < placeholders_count; i++) {
         free((void *)placeholders[i].FileIdentity);
+        free((void *)placeholders[i].RelativeFileName);
+    }
     free(placeholders);
 }
 
