@@ -684,6 +684,11 @@ static int DeleteDirectory(const wchar_t *sPath) {
                 if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
                     _wchmod(FileName, _S_IWRITE);
 
+                // overwrite files before deleting
+                FILE *file = NULL;
+                if (!_wfopen_s(&file, FileName, L"w"))
+                    fclose(file);
+
                 DeleteFileW(FileName);
                 wcscpy(FileName, DirPath);
             }
