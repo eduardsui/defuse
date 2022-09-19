@@ -29,20 +29,20 @@
 
 struct fuse_chan {
     wchar_t path[MAX_PATH + 1];
-    struct fuse* fs;
+    struct fuse *fs;
 };
 
 struct fuse {
     struct fuse_operations op;
     struct fuse_conn_info connection;
     struct fuse_chan* ch;
-    void* user_data;
-    char* path_utf8;
+    void *user_data;
+    char *path_utf8;
     CF_CONNECTION_KEY s_transferCallbackConnectionKey;
     char running;
 };
 
-static char *toUTF8(const wchar_t* src) {
+static char *toUTF8(const wchar_t *src) {
     if (!src)
         return NULL;
 
@@ -56,7 +56,7 @@ static char *toUTF8(const wchar_t* src) {
     return buf;
 }
 
-static char *toUTF8_path(const wchar_t* src, int bytes_len) {
+static char *toUTF8_path(const wchar_t *src, int bytes_len) {
     if ((!src) || (!src[0]) || (bytes_len <= 0))
         return _strdup("/");
 
@@ -75,7 +75,7 @@ static char *toUTF8_path(const wchar_t* src, int bytes_len) {
     return buf;
 }
 
-static wchar_t *fromUTF8(const char* src) {
+static wchar_t *fromUTF8(const char *src) {
     if (!src)
         src = "";
 
@@ -104,7 +104,7 @@ int fuse_is_read_only(struct fuse *f, const char *path) {
 }
 
 void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
-    struct fuse* f = (struct fuse*)callbackInfo->CallbackContext;
+    struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
 
     CF_OPERATION_INFO opInfo = { 0 };
     CF_OPERATION_PARAMETERS opParams = { 0 };
@@ -113,6 +113,8 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     opInfo.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
     opInfo.ConnectionKey = callbackInfo->ConnectionKey;
     opInfo.TransferKey = callbackInfo->TransferKey;
+    opInfo.RequestKey = callbackInfo->RequestKey;
+
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(TransferData);
     opParams.TransferData.CompletionStatus = STATUS_SUCCESS;
     opParams.TransferData.Offset.QuadPart = 0;
@@ -121,7 +123,6 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     int open_err = 0;
     struct fuse_file_info finfo = { 0 };
     char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
-
     if (f->op.open)
         open_err = f->op.open(path, &finfo);
 
@@ -130,32 +131,34 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
         CfExecute(&opInfo, &opParams);
     } else {
         if (f->op.read) {
-            size_t size = (size_t)callbackParameters->FetchData.RequiredLength.QuadPart;
-            off_t offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
+            __int64 size = (__int64)callbackParameters->FetchData.RequiredLength.QuadPart;
+            __int64 offset = (off_t)callbackParameters->FetchData.RequiredFileOffset.QuadPart;
 
             LARGE_INTEGER ProviderProgressCompleted = { 0 };
 
             char buf[8192];
-            int read_size = size;
+            __int64 read_size = size;
             if (read_size > sizeof(buf))
                 read_size = sizeof(buf);
 
             do {
                 int err = f->op.read(path, buf, read_size, offset, &finfo);
                 if (err < 0) {
-                    opParams.TransferData.CompletionStatus = STATUS_UNSUCCESSFUL;
-                    opParams.TransferData.Buffer = NULL;
+                    opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(EIO);
+                    opParams.TransferData.Buffer = buf;
                     opParams.TransferData.Offset.QuadPart = offset;
-                    opParams.TransferData.Length.QuadPart = 0;
+                    opParams.TransferData.Length.QuadPart = read_size;
+
+                    CfExecute(&opInfo, &opParams);
                     break;
                 } else {
                     opParams.TransferData.Buffer = buf;
                     opParams.TransferData.Offset.QuadPart = offset;
                     opParams.TransferData.Length.QuadPart = err;
+                    opParams.TransferData.CompletionStatus = STATUS_SUCCESS;
                     
                     CfExecute(&opInfo, &opParams);
 
-                    opParams.TransferData.CompletionStatus = STATUS_SUCCESS;
                     ProviderProgressCompleted.QuadPart += err;
                     CfReportProviderProgress(callbackInfo->ConnectionKey, callbackInfo->TransferKey, callbackParameters->FetchData.RequiredLength, ProviderProgressCompleted);
 
@@ -176,11 +179,11 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
     free(path);
 }
 
-void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
+void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     // to do
 }
 
-static int is_modified(struct fuse* f, char* path, char *full_path) {
+static int is_modified(struct fuse *f, char *path, char *full_path) {
     struct stat st_buf = { 0 };
 
     FILE* local_file = NULL;
@@ -216,7 +219,7 @@ static int is_modified(struct fuse* f, char* path, char *full_path) {
     return 1;
 }
 
-static int fuse_sync_full_sync(struct fuse* f, char* path, char *full_path) {
+static int fuse_sync_full_sync(struct fuse *f, char *path, char *full_path) {
     struct fuse_file_info finfo = { 0 };
 
     if (!f->op.write)
@@ -384,7 +387,7 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
 }
 
 void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
-    struct fuse* f = (struct fuse*)callbackInfo->CallbackContext;
+    struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
     int err = -1;
     char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
     char *path2;
@@ -411,8 +414,8 @@ void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     CfExecute(&opInfo, &opParams);
 }
 
-static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, off_t off) {
-    struct fuse* f = (struct fuse*)((void**)buf)[0];
+static int fuse_fill_dir(void *buf, const char *name, const struct stat *stbuf, off_t off) {
+    struct fuse *f = (struct fuse*)((void**)buf)[0];
     CF_PLACEHOLDER_CREATE_INFO **placeholders = (CF_PLACEHOLDER_CREATE_INFO **)((void **)buf)[1];
     unsigned int *placeholders_count = (unsigned int *)((void**)buf)[2];
     struct fuse_file_info* finfo = (struct fuse_file_info*)((void**)buf)[3];
@@ -426,29 +429,27 @@ static int fuse_fill_dir(void* buf, const char* name, const struct stat* stbuf, 
     if (off < finfo->offset)
         return 0;
 
-    if ((!name) || ((name[0] == '.') && (name[1] == 0)) || ((name[0] == '.') && (name[1] == '.') && (name[2] == 0))) {
-        finfo->session_offset++;
-        return 0;
-    }
     if ((!stbuf) && (f->op.getattr) && (name) && (path) && (path[0])) {
         memset(&stbuf2, 0, sizeof(stbuf2));
-        int len_name = (int)strlen(name);
-        int len_path = (int)strlen(path);
-        char* full_path = (char*)malloc(len_path + len_name + 2);
-        if (full_path) {
-            memcpy(full_path, path, len_path);
-            if (path[len_path - 1] == '/') {
-                memcpy(full_path + len_path, name, len_name);
-                full_path[len_path + len_name] = 0;
+        if ((!strcmp(name, ".")) && (!strcmp(name, ".."))) {
+            int len_name = (int)strlen(name);
+            int len_path = (int)strlen(path);
+            char* full_path = (char*)malloc(len_path + len_name + 2);
+            if (full_path) {
+                memcpy(full_path, path, len_path);
+                if (path[len_path - 1] == '/') {
+                    memcpy(full_path + len_path, name, len_name);
+                    full_path[len_path + len_name] = 0;
+                } else {
+                        memcpy(full_path + len_path + 1, name, len_name);
+                        full_path[len_path] = '/';
+                        full_path[len_path + len_name + 1] = 0;
+                }
+                free(full_path);
             }
-            else {
-                memcpy(full_path + len_path + 1, name, len_name);
-                full_path[len_path] = '/';
-                full_path[len_path + len_name + 1] = 0;
-            }
-            if (!f->op.getattr(full_path, &stbuf2))
+        } else {
+            if (!f->op.getattr(path, &stbuf2))
                 stbuf = &stbuf2;
-            free(full_path);
         }
     }
     CF_PLACEHOLDER_CREATE_INFO *placeholders2 = (CF_PLACEHOLDER_CREATE_INFO *)realloc(*placeholders, sizeof(CF_PLACEHOLDER_CREATE_INFO) * ((*placeholders_count) + 1));
@@ -554,7 +555,7 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
     free(placeholders);
 }
 
-void CALLBACK OnValidateData(CONST CF_CALLBACK_INFO* callbackInfo, CONST CF_CALLBACK_PARAMETERS* callbackParameters) {
+void CALLBACK OnValidateData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     // to do
 }
 
@@ -600,7 +601,7 @@ struct fuse_chan *fuse_mount(const char *dir, void* args) {
     return ch;
 }
 
-int fuse_loop(struct fuse* f) {
+int fuse_loop(struct fuse *f) {
     CF_CALLBACK_REGISTRATION callbackTable[] = {
         { CF_CALLBACK_TYPE_FETCH_DATA, OnFetchData },
         { CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION, OnFileOpen },
@@ -629,7 +630,7 @@ int fuse_loop(struct fuse* f) {
     return 0;
 }
 
-int fuse_loop_mt(struct fuse* f) {
+int fuse_loop_mt(struct fuse *f) {
     return fuse_loop(f);
 }
 
@@ -637,8 +638,8 @@ static int DeleteDirectory(const wchar_t *sPath) {
     HANDLE hFind;
     WIN32_FIND_DATAW FindFileData;
 
-    wchar_t DirPath[MAX_PATH];
-    wchar_t FileName[MAX_PATH];
+    wchar_t DirPath[4096];
+    wchar_t FileName[4096];
 
     wcscpy(DirPath, sPath);
     wcscat(DirPath, L"\\*");
@@ -664,8 +665,7 @@ static int DeleteDirectory(const wchar_t *sPath) {
                 }
                 RemoveDirectoryW(FileName);
                 wcscpy(FileName, DirPath);
-            }
-            else {
+            } else {
                 if (FindFileData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
                     _wchmod(FileName, _S_IWRITE);
                 if (!DeleteFileW(FileName)) {
@@ -674,12 +674,10 @@ static int DeleteDirectory(const wchar_t *sPath) {
                 }
                 wcscpy(FileName, DirPath);
             }
-        }
-        else {
+        } else {
             if (GetLastError() == ERROR_NO_MORE_FILES) {
                 bSearch = 0;
-            }
-            else {
+            } else {
                 FindClose(hFind);
                 return 0;
             }
@@ -691,7 +689,7 @@ static int DeleteDirectory(const wchar_t *sPath) {
     return RemoveDirectoryW(sPath);
 }
 
-struct fuse* fuse_new(struct fuse_chan* ch, void* args, const struct fuse_operations* op, size_t op_size, void* private_data) {
+struct fuse *fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operations *op, size_t op_size, void* private_data) {
     if (!ch)
         return NULL;
 
@@ -718,11 +716,11 @@ struct fuse* fuse_new(struct fuse_chan* ch, void* args, const struct fuse_operat
     return this_ref;
 }
 
-void fuse_unmount(const char* dir, struct fuse_chan* ch) {
+void fuse_unmount(const char *dir, struct fuse_chan *ch) {
     // not implemented
 }
 
-int fuse_set_signal_handlers(struct fuse* se) {
+int fuse_set_signal_handlers(struct fuse *se) {
     if (!se)
         return -1;
 
@@ -731,15 +729,15 @@ int fuse_set_signal_handlers(struct fuse* se) {
     return 0;
 }
 
-struct fuse* fuse_get_session(struct fuse* f) {
+struct fuse *fuse_get_session(struct fuse *f) {
     return f;
 }
 
-void fuse_remove_signal_handlers(struct fuse* se) {
+void fuse_remove_signal_handlers(struct fuse *se) {
     // not implemented
 }
 
-void fuse_exit(struct fuse* f) {
+void fuse_exit(struct fuse *f) {
     if ((f) && (f->running == 1)) {
         CfDisconnectSyncRoot(f->s_transferCallbackConnectionKey);
         if (f->ch) {
@@ -750,14 +748,14 @@ void fuse_exit(struct fuse* f) {
     }
 }
 
-int fuse_reload(struct fuse* f) {
+int fuse_reload(struct fuse *f) {
     if ((!f) || (!f->ch))
         return -1;
 
     return 0;
 }
 
-void fuse_destroy(struct fuse* f) {
+void fuse_destroy(struct fuse *f) {
     if (f) {
         if (f->op.init)
             f->op.destroy(f->user_data);
