@@ -23,7 +23,7 @@
 #ifdef DEBUG
     #define DEBUG_INFO_DUMP                 fprintf(stderr, "::%s:%i> ", __func__, (int)__LINE__);
     #define DEBUG_DUMP(message, ...)        { DEBUG_INFO_DUMP fprintf(stderr, message "\n", __VA_ARGS__); }
-    #define DEBUG_NOTE(message)             DEBUG_DUMP(message, NULL);
+    #define DEBUG_NOTE(message)             DEBUG_DUMP("%s", message);
 
     #define DEBUG_ERRNO(key, err)           DEBUG_DUMP("%s returned %i (%s)", key, (int)err, strerror(err < 0 ? -err : err));
 
@@ -70,9 +70,36 @@ struct fuse {
     void *user_data;
     char *path_utf8;
     CF_CONNECTION_KEY s_transferCallbackConnectionKey;
+    DWORD disable_root;
     char running;
 };
 
+static int update_policy(struct fuse *f, CF_REGISTER_FLAGS policy);
+
+static void update_placeholder_flags(const wchar_t *NormalizedPath, CF_UPDATE_FLAGS flags) {
+    HANDLE h;
+    DEBUG_DUMP("update_placeholder_flags %S", NormalizedPath);
+    HRESULT hr2 = CfOpenFileWithOplock(NormalizedPath, CF_OPEN_FILE_FLAG_NONE, &h);
+    DEBUG_ERRNO("CfOpenFileWithOplock", hr2);
+    if (!FAILED(hr2)) {
+        hr2 = CfUpdatePlaceholder(h, NULL, NULL, 0, NULL, 0, flags, NULL, NULL);
+        DEBUG_ERRNO("CfUpdatePlaceholder", hr2);
+        CfCloseHandle(h);
+    }
+}
+
+static char *get_full_path(const char *path, const char *name) {
+    int len_name = name ? (int)strlen(name) : 0;
+    int len_path = path ? (int)strlen(path) : 0;
+    char *full_path = (char *)malloc(len_path + len_name + 1);
+
+    if (full_path) {
+        memcpy(full_path, path, len_path);
+        memcpy(full_path + len_path, name, len_name);
+        full_path[len_path + len_name] = 0;
+    }
+    return full_path;
+}
 
 static char *toUTF8(const wchar_t *src) {
     if (!src)
@@ -113,7 +140,7 @@ static wchar_t *fromUTF8(const char *src) {
 
     int len = (int)strlen(src);
     int length = MultiByteToWideChar(CP_UTF8, 0, src, len, 0, 0);
-    wchar_t* buf = (wchar_t*)malloc((length + 1) * sizeof(wchar_t));
+    wchar_t *buf = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
     if (buf) {
         MultiByteToWideChar(CP_UTF8, 0, src, len, buf, length);
         buf[length] = 0;
@@ -136,7 +163,7 @@ int fuse_is_read_only(struct fuse *f, const char *path) {
 }
 
 void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
-    struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
+    struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
 
     CF_OPERATION_INFO opInfo = { 0 };
     CF_OPERATION_PARAMETERS opParams = { 0 };
@@ -155,7 +182,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 
     int open_err = 0;
     struct fuse_file_info finfo = { 0 };
-    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+    char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
 
     DEBUG_DUMP("FetchData %s", path);
 
@@ -228,11 +255,30 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 }
 
 void CALLBACK OnFileOpen(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
+    struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
 #ifdef DEBUG
-    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+    char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
     DEBUG_DUMP("File opened %s", path);
     free(path);
 #endif
+    wchar_t *placeholder_path = NULL;
+    ULONG len = GetFullPathNameW(callbackInfo->NormalizedPath, 0, 0, 0);
+    DEBUG_DUMP("GetFullPathNameW returned %i", (int)len);
+    if (len > 0) {
+        placeholder_path = (wchar_t *)malloc((len + 1) * sizeof(wchar_t));
+        if (placeholder_path) {
+            wchar_t *filepart = NULL;
+            if (GetFullPathNameW(callbackInfo->NormalizedPath, len, placeholder_path, &filepart) > 0) {
+                // get only the path
+                if (filepart)
+                    filepart[0] = 0;
+                update_placeholder_flags(placeholder_path, CF_UPDATE_FLAG_ENABLE_ON_DEMAND_POPULATION);
+                update_policy(f, CF_REGISTER_FLAG_NONE);
+            }
+            free(placeholder_path);
+        }
+    }
+    
 }
 
 static int is_modified(struct fuse *f, char *path, char *full_path) {
@@ -241,7 +287,7 @@ static int is_modified(struct fuse *f, char *path, char *full_path) {
     FILE* local_file = NULL;
     
     int err = fopen_s(&local_file, full_path, "rb");
-    if (!local_file)
+    if ((err) || (!local_file))
         return 0;
 
     __int64 fuse_file_size = 0;
@@ -292,11 +338,8 @@ static int fuse_sync_full_sync(struct fuse *f, char *path, char *full_path) {
 
     if (f->op.truncate) {
         __int64 fuse_file_size = 0;
-        int has_stat = 0;
-        if ((f->op.getattr) && (!f->op.getattr(path, &st_buf))) {
+        if ((f->op.getattr) && (!f->op.getattr(path, &st_buf)))
             fuse_file_size = st_buf.st_size;
-            has_stat = 1;
-        }
 
         _fseeki64(local_file, 0, SEEK_END);
         __int64 fsize = _ftelli64(local_file);
@@ -372,7 +415,7 @@ static int fuse_sync_full_sync(struct fuse *f, char *path, char *full_path) {
 }
 
 void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
-    struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
+    struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
     DEBUG_NOTE("File close");
 
     HANDLE h;
@@ -389,7 +432,7 @@ void CALLBACK OnFileClose(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
         DEBUG_HANDLE("CfDehydratePlaceholder", hr);
         // not in sync
         if (hr == 0x80070179) {
-            char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+            char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
             char *full_path = toUTF8(callbackInfo->NormalizedPath);
             DEBUG_DUMP("Sync %s (%s)", path, full_path);
             if (!is_modified(f, path, full_path)) {
@@ -438,7 +481,7 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
     struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
     int err = -1;
 
-    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+    char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
     DEBUG_DUMP("Delete %s", path);
 
     if (!fuse_is_read_only(f, path)) {
@@ -473,15 +516,15 @@ void CALLBACK OnFileDelete(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
 }
 
 void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
-    struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
+    struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
     int err = -1;
-    char *path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+    char *path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
     char *path2;
 
     DEBUG_DUMP("Rename %s", path);
 
     if ((f->op.rename) && (!fuse_is_read_only(f, path))) {
-        path = toUTF8_path((wchar_t*)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
+        path = toUTF8_path((wchar_t *)callbackInfo->FileIdentity, callbackInfo->FileIdentityLength);
         path2 = toUTF8_path(callbackParameters->Rename.TargetPath, callbackParameters->Rename.TargetPath ? wcslen(callbackParameters->Rename.TargetPath) : 0);
         err = f->op.rename(path, path2, 0);
         DEBUG_DUMP("Rename %s to %s, errno: %i", path, path2, err);
@@ -508,13 +551,12 @@ void CALLBACK OnFileRename(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBA
 }
 
 static int fuse_fill_dir(void *buf, const char *name, const struct stat *stbuf, off_t off) {
-    struct fuse *f = (struct fuse*)((void**)buf)[0];
+    struct fuse *f = (struct fuse *)((void**)buf)[0];
     CF_PLACEHOLDER_CREATE_INFO **placeholders = (CF_PLACEHOLDER_CREATE_INFO **)((void **)buf)[1];
     unsigned int *placeholders_count = (unsigned int *)((void**)buf)[2];
     struct fuse_file_info* finfo = (struct fuse_file_info*)((void**)buf)[3];
     struct stat stbuf2;
     char *path = (char *)((void**)buf)[4];
-    PCWSTR SearchExpression = (PCWSTR)((void**)buf)[5];
 
     if ((!finfo) || (!f)) {
         DEBUG_NOTE("I/O error");
@@ -579,6 +621,15 @@ static int fuse_fill_dir(void *buf, const char *name, const struct stat *stbuf, 
         if (S_ISDIR(stbuf->st_mode)) {
             placeholder->FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
             placeholder->FsMetadata.FileSize.QuadPart = 0;
+
+            if ((!name) || (name[0] != '.') || (name[1] != '.')) {
+                // skip . and ..
+                char *full_sys_path = get_full_path(f->path_utf8, full_path);
+                wchar_t *full_sys_path_w = fromUTF8(full_sys_path);
+                update_placeholder_flags(full_sys_path_w, CF_UPDATE_FLAG_ENABLE_ON_DEMAND_POPULATION);
+                free(full_sys_path_w);
+                free(full_sys_path);
+            }
         } else {
             placeholder->FsMetadata.FileSize.QuadPart = stbuf->st_size;
         }
@@ -614,7 +665,7 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
 
     opParams.ParamSize = CF_SIZE_OF_OP_PARAM(TransferPlaceholders);
     opParams.TransferPlaceholders.CompletionStatus = STATUS_SUCCESS;
-    struct fuse *f = (struct fuse*)callbackInfo->CallbackContext;
+    struct fuse *f = (struct fuse *)callbackInfo->CallbackContext;
 
     CF_PLACEHOLDER_CREATE_INFO *placeholders = NULL;
     unsigned int placeholders_count = 0;
@@ -636,14 +687,12 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
 
         if (!open_err) {
             if (f->op.readdir) {
-
-                void* data[6];
+                void* data[5];
                 data[0] = (void*)f;
                 data[1] = (void*)&placeholders;
                 data[2] = (void*)&placeholders_count;
                 data[3] = (void*)&fi;
                 data[4] = (void*)path;
-                data[5] = (void*)callbackParameters->FetchPlaceholders.Pattern;
 
                 int err = f->op.readdir(path, data, fuse_fill_dir, fi.offset, &fi);
                 if (err)
@@ -659,6 +708,7 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
                 f->op.releasedir(path, &fi);
         }
 
+
         free(path);
     }
 
@@ -671,6 +721,12 @@ void CALLBACK OnFetchPlaceholders(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF
         free((void *)placeholders[i].RelativeFileName);
     }
     free(placeholders);
+
+    if (!callbackInfo->FileIdentityLength) {
+        update_policy(f, CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT);
+    } else {
+        update_placeholder_flags(callbackInfo->NormalizedPath, CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION);
+    }
 }
 
 void CALLBACK OnValidateData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
@@ -681,6 +737,33 @@ void CALLBACK OnValidateData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALL
 void CALLBACK OnCancelFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBACK_PARAMETERS *callbackParameters) {
     // to do
     DEBUG_NOTE("Cancel fetch data");
+}
+
+static int update_policy(struct fuse *f, CF_REGISTER_FLAGS policy) {
+    if ((!f) || (!f->ch))
+        return -1;
+
+    CF_SYNC_REGISTRATION CfSyncRegistration = { 0 };
+    CfSyncRegistration.StructSize = sizeof(CF_SYNC_REGISTRATION);
+    CfSyncRegistration.ProviderName = L"edwork";
+    CfSyncRegistration.ProviderVersion = L"1.0";
+    CfSyncRegistration.ProviderId = (GUID){ 0x328cd0f9, 0x9f45, 0x4d22, { 0x90, 0x86, 0x73, 0x8a, 0xe5, 0x83, 0x5c, 0x20 } };
+
+    CF_SYNC_POLICIES CfSyncPolicies = { 0 };
+    CfSyncPolicies.StructSize = sizeof(CF_SYNC_POLICIES);
+    CfSyncPolicies.HardLink = CF_HARDLINK_POLICY_NONE;
+    CfSyncPolicies.Hydration.Primary = CF_HYDRATION_POLICY_PROGRESSIVE;
+    CfSyncPolicies.Hydration.Modifier = CF_HYDRATION_POLICY_MODIFIER_STREAMING_ALLOWED | CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED;
+    CfSyncPolicies.InSync = CF_INSYNC_POLICY_TRACK_FILE_LAST_WRITE_TIME | CF_INSYNC_POLICY_TRACK_DIRECTORY_LAST_WRITE_TIME;
+    CfSyncPolicies.Population.Primary = CF_POPULATION_POLICY_FULL;
+    CfSyncPolicies.Population.Modifier = CF_POPULATION_POLICY_MODIFIER_NONE;
+    CfSyncPolicies.PlaceholderManagement = CF_PLACEHOLDER_MANAGEMENT_POLICY_CREATE_UNRESTRICTED | CF_PLACEHOLDER_MANAGEMENT_POLICY_CONVERT_TO_UNRESTRICTED | CF_PLACEHOLDER_MANAGEMENT_POLICY_UPDATE_UNRESTRICTED;
+
+    HRESULT hr = CfRegisterSyncRoot(f->ch->path, &CfSyncRegistration, &CfSyncPolicies, CF_REGISTER_FLAG_UPDATE | policy);
+    DEBUG_HANDLE("CfRegisterSyncRoot", hr);
+    if (FAILED(hr))
+        return -1;
+    return 0;
 }
 
 struct fuse_chan *fuse_mount(const char *dir, void* args) {
@@ -726,19 +809,6 @@ struct fuse_chan *fuse_mount(const char *dir, void* args) {
     return ch;
 }
 
-static char *get_full_path(char *path, char *name) {
-    int len_name = name ? (int)strlen(name) : 0;
-    int len_path = path ? (int)strlen(path) : 0;
-    char *full_path = (char *)malloc(len_path + len_name + 1);
-
-    if (full_path) {
-        memcpy(full_path, path, len_path);
-        memcpy(full_path + len_path, name, len_name);
-        full_path[len_path + len_name] = 0;
-    }
-    return full_path;
-}
-
 int fuse_loop(struct fuse *f) {
     CF_CALLBACK_REGISTRATION callbackTable[] = {
         { CF_CALLBACK_TYPE_FETCH_DATA, OnFetchData },
@@ -778,7 +848,7 @@ int fuse_loop(struct fuse *f) {
         f->running = 1;
 
     while (f->running == 1) {
-        DWORD wait_status = WaitForSingleObject(overlapped.hEvent, 1000); 
+        DWORD wait_status = WaitForSingleObject(overlapped.hEvent, 100); 
 
         if (wait_status == WAIT_OBJECT_0) {
             DWORD bytes_transferred;
@@ -791,7 +861,9 @@ int fuse_loop(struct fuse *f) {
                     char *full_path = get_full_path(f->path_utf8, path);
                     DEBUG_DUMP("Created %s", full_path);
                     int err = -1;
+                    int is_dir = 0;
                     if (GetFileAttributesA(full_path) & FILE_ATTRIBUTE_DIRECTORY) {
+                        is_dir = 1;
                         if (f->op.mkdir) {
                             err = f->op.mkdir(path, 0666);
                             DEBUG_ERRNO("op.mkdir", err);
@@ -813,14 +885,15 @@ int fuse_loop(struct fuse *f) {
                         DEBUG_HANDLE("CfOpenFileWithOplock", hr);
                         if (!FAILED(hr)) {
                             wchar_t *wname = fromUTF8(path);
-                            HRESULT hr2 = CfConvertToPlaceholder(h, wname, wcslen(wname) * sizeof(wchar_t), CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION, NULL, NULL);
+                            HRESULT hr2 = CfConvertToPlaceholder(h, wname, wcslen(wname) * sizeof(wchar_t), is_dir ? CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION : CF_CONVERT_FLAG_NONE , NULL, NULL);
                             DEBUG_HANDLE("CfConvertToPlaceholder", hr2);
                             CfCloseHandle(h);
+                            free(wname);
                         }
-                        free(full_path_w);
                     }
                     free(full_path);
                     free(path);
+                    update_policy(f, CF_REGISTER_FLAG_NONE);
                 }
                 if (ev->NextEntryOffset)
                     *((uint8_t**)&ev) += ev->NextEntryOffset;
@@ -901,7 +974,7 @@ struct fuse *fuse_new(struct fuse_chan *ch, void *args, const struct fuse_operat
     if (!ch)
         return NULL;
 
-    struct fuse* this_ref = (struct fuse*)malloc(sizeof(struct fuse));
+    struct fuse * this_ref = (struct fuse *)malloc(sizeof(struct fuse));
     if (!this_ref) {
         DEBUG_NOTE("malloc failed");
         return NULL;
