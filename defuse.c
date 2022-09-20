@@ -788,27 +788,22 @@ int fuse_loop(struct fuse *f) {
             for (;;) {
                 if (ev->Action == FILE_ACTION_ADDED) {
                     char *path = toUTF8_path(ev->FileName, ev->FileNameLength);
-                    char *full_path = get_full_path(f->path_utf8, path + 1);
+                    char *full_path = get_full_path(f->path_utf8, path);
                     DEBUG_DUMP("Created %s", full_path);
-                    struct stat stbuf;
                     int err = -1;
-                    if (!stat(full_path, &stbuf)) {
-                        if (S_ISDIR(stbuf.st_mode)) {
-                            if (f->op.mkdir) {
-                                err = f->op.mkdir(path, 0666);
-                                DEBUG_ERRNO("op.mkdir", err);
-                            }
-                        } else {
-                            if (f->op.create) {
-                                struct fuse_file_info finfo = { 0 };
-                                err = f->op.create(path, 0666, &finfo);
-                                DEBUG_ERRNO("op.create", errno);
-                                if ((f->op.release) && (!err))
-                                    f->op.release(path, &finfo);
-                            }
+                    if (GetFileAttributesA(full_path) & FILE_ATTRIBUTE_DIRECTORY) {
+                        if (f->op.mkdir) {
+                            err = f->op.mkdir(path, 0666);
+                            DEBUG_ERRNO("op.mkdir", err);
                         }
                     } else {
-                        DEBUG_ERRNO("stat error", errno);
+                        if (f->op.create) {
+                            struct fuse_file_info finfo = { 0 };
+                            err = f->op.create(path, 0666, &finfo);
+                            DEBUG_ERRNO("op.create", errno);
+                            if ((f->op.release) && (!err))
+                                f->op.release(path, &finfo);
+                        }
                     }
                     if (!err) {
                         HANDLE h;
