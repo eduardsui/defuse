@@ -6,6 +6,8 @@
 
 #define DEBUG
 
+#define DIRECTORY_POPULATE_TIMEOUT_MS   4000
+
 #include "defuse.h"
 
 #include <stdio.h>
@@ -26,6 +28,7 @@
     #define DEBUG_NOTE(message)             DEBUG_DUMP("%s", message);
 
     #define DEBUG_ERRNO(key, err)           DEBUG_DUMP("%s returned %i (%s)", key, (int)err, strerror(err < 0 ? -err : err));
+    #define DEBUG_ERRNO2(key, err)          DEBUG_DUMP("%s returned %i (%s)", key, (int)err, err < 0 ? strerror(-err) : "ACK");
 
     static void __DEBUG_HANDLE(const char *key, HRESULT hr, const char *func, int line) {
         if (hr != S_OK) {
@@ -45,6 +48,7 @@
     #define DEBUG_NOTE(message)
 
     #define DEBUG_ERRNO(key, err)
+    #define DEBUG_ERRNO2(key, err)
     #define DEBUG_HANDLE(key, err)
 #endif
 
@@ -191,7 +195,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 
     DEBUG_ERRNO("op.open", open_err);
 
-    char buf[8192];
+    char buf[0x10000];
     HRESULT hr;
     if (open_err) {
         opParams.TransferData.Buffer = buf;
@@ -364,7 +368,7 @@ static int fuse_sync_full_sync(struct fuse *f, char *path, char *full_path) {
     off_t offset = 0;
     while (!feof(local_file)) {
         size_t bytes = fread(buffer, 1, sizeof(buffer), local_file);
-        DEBUG_ERRNO("fread", err);
+        DEBUG_ERRNO2("fread", bytes);
         if (bytes <= 0) {
             if (bytes < 0)
                 err = -EIO;
@@ -375,7 +379,7 @@ static int fuse_sync_full_sync(struct fuse *f, char *path, char *full_path) {
         off_t written = 0;
         do {
             err = f->op.write(path, buffer + written, bytes - written, offset + written, &finfo);
-            DEBUG_ERRNO("op.write", err);
+            DEBUG_ERRNO2("op.write", err);
             if (err <= 0)
                 break;
 
@@ -837,7 +841,7 @@ int fuse_loop(struct fuse *f) {
     overlapped.hEvent = CreateEvent(NULL, FALSE, 0, NULL);
 
     uint8_t change_buf[1024];
-    BOOL success = ReadDirectoryChangesW(dir_handle, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME, NULL, &overlapped, NULL);
+    BOOL success = ReadDirectoryChangesW(dir_handle, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, NULL);
     DEBUG_DUMP("ReadDirectoryChangesW returned %s", success ? "TRUE" : "FALSE");
 
     HRESULT hr = CfConnectSyncRoot(f->ch->path, callbackTable, f, CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, &f->s_transferCallbackConnectionKey);
@@ -847,6 +851,7 @@ int fuse_loop(struct fuse *f) {
     else
         f->running = 1;
 
+    DWORD populate_root = 0;
     while (f->running == 1) {
         DWORD wait_status = WaitForSingleObject(overlapped.hEvent, 100); 
 
@@ -854,6 +859,9 @@ int fuse_loop(struct fuse *f) {
             DWORD bytes_transferred;
             GetOverlappedResult(dir_handle, &overlapped, &bytes_transferred, FALSE);
             FILE_NOTIFY_INFORMATION *ev = (FILE_NOTIFY_INFORMATION *)change_buf;
+
+            if (f->running != 1)
+                break;
 
             for (;;) {
                 if (ev->Action == FILE_ACTION_ADDED) {
@@ -894,13 +902,43 @@ int fuse_loop(struct fuse *f) {
                     free(full_path);
                     free(path);
                     update_policy(f, CF_REGISTER_FLAG_NONE);
+                    populate_root = GetTickCount();
+                } else
+                if (ev->Action == FILE_ACTION_MODIFIED) {
+                    char *path = toUTF8_path(ev->FileName, ev->FileNameLength);
+                    char *full_path = get_full_path(f->path_utf8, path);
+                    if (!(GetFileAttributesA(full_path) & FILE_ATTRIBUTE_DIRECTORY)) {
+                        DEBUG_DUMP("Modified %s", full_path);
+                        fuse_sync_full_sync(f, path, full_path);
+
+                        HANDLE h;
+                        wchar_t *full_path_w = fromUTF8(full_path);
+                        HRESULT hr = CfOpenFileWithOplock(full_path_w, CF_OPEN_FILE_FLAG_NONE, &h);
+                        free(full_path_w);
+                        DEBUG_HANDLE("CfOpenFileWithOplock", hr);
+                        if (!FAILED(hr)) {
+                            wchar_t *wname = fromUTF8(path);
+                            HRESULT hr2 = CfConvertToPlaceholder(h, wname, wcslen(wname) * sizeof(wchar_t), CF_CONVERT_FLAG_MARK_IN_SYNC, NULL, NULL);
+                            DEBUG_HANDLE("CfConvertToPlaceholder", hr2);
+                            CfCloseHandle(h);
+                            free(wname);
+                        }
+                    }
+                    free(full_path);
+                    free(path);
                 }
+
                 if (ev->NextEntryOffset)
                     *((uint8_t**)&ev) += ev->NextEntryOffset;
                 else
                     break;
             }
             ReadDirectoryChangesW(dir_handle, change_buf, 1024, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME, NULL, &overlapped, NULL);
+        }
+        if (GetTickCount() - populate_root >= DIRECTORY_POPULATE_TIMEOUT_MS) {
+            DEBUG_NOTE("resetting root populate policy");
+            update_policy(f, CF_REGISTER_FLAG_NONE);
+            populate_root = GetTickCount();
         }
     }
     CloseHandle(dir_handle);
