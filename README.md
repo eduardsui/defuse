@@ -10,7 +10,7 @@ The reason for writting this is that unlinke the two implementations of FUSE for
 Just add `defuse.c` and `defuse.h` to your fuse project and `#include "defuse.h"` instead of `fuse.h`.
 
 # Implemented callbacks
-`defuse` implements some (but not all) of the `fus`e callbacks:
+`defuse` implements some (but not all) of the `fuse` callbacks:
 
 `statfs`, `open`, `opendir`, `create`, `mkdir`, `read`, `write`, `truncate`, `readdir`, `unlink`, `rmdir`, `release`, `releasedir`, `rename`, `getattr`, `flush`, `fsync`, `utimens`, `init`, `destroy`
 
