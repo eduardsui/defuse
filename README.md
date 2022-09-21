@@ -3,7 +3,7 @@ Single C-file library mapping basic fuse APIs(somehow compatible with libfuse) o
 
 This library was written for one of my projects(edwork).
 
-The reason for writting this is that unlinke the two implementations of FUSE for Microsoft Windows that I am aware of (Dokan and WinFSP), defuse doesn't have any dependencies and doesn't require any driver installation or superuser privileges. Also, this code has no license restrictions (public domain).
+The reason for writting this is that unlinke the two implementations of FUSE for Microsoft Windows that I am aware of (Dokan and WinFSP), `defuse` doesn't have any dependencies and doesn't require any driver installation or superuser privileges. In a nutshell defuse is fuse over Win32 APIs. Also, this code has no license restrictions (public domain).
 
 
 # Usage
