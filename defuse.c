@@ -433,18 +433,6 @@ static int fuse_sync_full_sync(struct fuse *f, char *path, char *full_path) {
         err = 0;
     fclose(local_file);
 
-    if (f->op.flush) {
-        fuse_lock(f);
-        f->op.flush(path, &finfo);
-        fuse_unlock(f);
-    }
-
-    if (f->op.fsync) {
-        fuse_lock(f);
-        f->op.fsync(path, 0, &finfo);
-        fuse_unlock(f);
-    }
-
     if (f->op.utimens) {
         if (!stat(full_path, &st_buf)) {
             struct timespec tv[2];
