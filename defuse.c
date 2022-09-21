@@ -240,6 +240,7 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
 
             do {
                 int err = f->op.read(path, buf, read_size, offset, &finfo);
+                DEBUG_ERRNO2("op.read", err);
                 if (err < 0) {
                     DEBUG_ERRNO("op.read", err);
                     opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(EIO);
@@ -260,6 +261,14 @@ void CALLBACK OnFetchData(CONST CF_CALLBACK_INFO *callbackInfo, CONST CF_CALLBAC
                     DEBUG_HANDLE("CfExecute", hr);
                     if (FAILED(hr)) {
                         // 0x8007018e: The cloud operation was canceled by user.
+                        if (hr != 0x8007018e) {
+                            DEBUG_DUMP("Error in CfExecute => offset %lld, len %i", offset, err);
+                            opParams.TransferData.CompletionStatus = NTSTATUS_FROM_WIN32(EIO);
+                            opParams.TransferData.Buffer = buf;
+                            opParams.TransferData.Offset.QuadPart = callbackParameters->FetchData.RequiredFileOffset.QuadPart;
+                            opParams.TransferData.Length.QuadPart = callbackParameters->FetchData.RequiredLength.QuadPart;
+                            hr = CfExecute(&opInfo, &opParams);
+                        }
                         break;
                     }
 
