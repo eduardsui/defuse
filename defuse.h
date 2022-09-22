@@ -154,7 +154,7 @@ struct fuse_operations {
     off_t (*lseek) (const char *, off_t off, int whence, struct fuse_file_info *);
     // defuse specific
     int (*history) (const char *, uint64_t timestamp_limit, unsigned char **hash, uint64_t *generation, uint64_t *timestamp, int history_limit);
-    char (*signature)(const char *, int signature_index);
+    char * (*signature)(const char *, int signature_index);
 };
 
 struct fuse_context {
