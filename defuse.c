@@ -157,6 +157,7 @@ void fuse_unlock(struct fuse *f) {
     ReleaseSemaphore(f->sem, 1, NULL);
 }
 
+/*
 static void update_placeholder_flags(const wchar_t *NormalizedPath, CF_UPDATE_FLAGS flags) {
     HANDLE h;
     DEBUG_DUMP("update_placeholder_flags %S", NormalizedPath);
@@ -173,6 +174,7 @@ static void update_placeholder_flags(const wchar_t *NormalizedPath, CF_UPDATE_FL
         CfCloseHandle(h);
     }
 }
+*/
 
 static char *get_full_path(const char *path, const char *name) {
     int len_name = name ? (int)strlen(name) : 0;
@@ -885,13 +887,14 @@ static int fuse_fill_dir_no_demand(void *buf, const char *name, const struct sta
 
     int is_dir = 0;
     // do not free wname nor placeholder->RelativeFileName here (it will be freed by OnFetchPlaceholders)
-    placeholder.Flags = CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION;
+    placeholder.Flags = CF_PLACEHOLDER_CREATE_FLAG_NONE;
     if (stbuf) {
         placeholder.Flags = CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
 
         if (S_ISDIR(stbuf->st_mode)) {
             placeholder.FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
             placeholder.FsMetadata.FileSize.QuadPart = 0;
+            placeholder.Flags |= CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION;
             is_dir = 1;
         } else {
             placeholder.FsMetadata.FileSize.QuadPart = stbuf->st_size;
@@ -1137,7 +1140,7 @@ static void recursive_create(struct fuse *f, char *path) {
         free(full_path_w);
         if (!FAILED(hr)) {
             wchar_t *wname = fromUTF8(path);
-            HRESULT hr2 = CfConvertToPlaceholder(h, wname, wcslen(wname) * sizeof(wchar_t), is_dir ? CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION : CF_CONVERT_FLAG_NONE , NULL, NULL);
+            HRESULT hr2 = CfConvertToPlaceholder(h, wname, wcslen(wname) * sizeof(wchar_t), /* is_dir ? CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION : */ CF_CONVERT_FLAG_NONE , NULL, NULL);
             DEBUG_HANDLE("CfConvertToPlaceholder", hr2);
             CfCloseHandle(h);
             free(wname);
